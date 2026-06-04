@@ -7,6 +7,7 @@ RUN npm run build
 
 FROM golang:1.25-bookworm AS go-builder
 WORKDIR /src
+ENV GOPROXY=https://goproxy.cn,direct
 COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd ./cmd
