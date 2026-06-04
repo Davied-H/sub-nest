@@ -15,7 +15,7 @@ permissions:
   packages: write
 
 env:
-  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/sub-nest
+  IMAGE_NAME: ghcr.io/davied-h/sub-nest
 
 jobs:
   release:
