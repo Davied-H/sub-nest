@@ -13,7 +13,23 @@ COPY cmd ./cmd
 COPY internal ./internal
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/subagg ./cmd/subagg
 
-FROM ubuntu:22.04
+FROM ubuntu:22.04 AS mihomo-core
+ARG TARGETARCH
+ARG MIHOMO_VERSION=v1.19.26
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl gzip \
+    && rm -rf /var/lib/apt/lists/* \
+    && case "$TARGETARCH" in \
+        amd64) artifact="mihomo-linux-amd64-compatible-${MIHOMO_VERSION}.gz" ;; \
+        arm64) artifact="mihomo-linux-arm64-${MIHOMO_VERSION}.gz" ;; \
+        *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac \
+    && curl -fsSL -o /tmp/mihomo.gz "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VERSION}/${artifact}" \
+    && mkdir -p /out \
+    && gzip -dc /tmp/mihomo.gz > /out/mihomo \
+    && chmod +x /out/mihomo
+
+FROM ubuntu:22.04 AS slim
 WORKDIR /app
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
@@ -26,3 +42,7 @@ ENV SUBAGG_ADDR=:8080 \
 EXPOSE 8080
 VOLUME ["/data"]
 CMD ["subagg"]
+
+FROM slim
+COPY --from=mihomo-core /out/mihomo /usr/local/bin/mihomo
+ENV SUBAGG_MIHOMO_BIN=/usr/local/bin/mihomo

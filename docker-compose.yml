@@ -1,17 +1,7 @@
 services:
   sub-nest:
     image: ghcr.io/davied-h/sub-nest:latest
-    container_name: sub-nest
-    restart: unless-stopped
-    environment:
-      SUBAGG_ADDR: ":8080"
-      SUBAGG_DATA: "/data/config.json"
-      SUBAGG_STATIC: "/app/web/dist"
-      # Optional: mount a Linux executable core below to enable real exit-IP probing.
-      # SUBAGG_MIHOMO_BIN: "/usr/local/bin/mihomo"
     ports:
       - "18788:8080"
     volumes:
       - ./data:/data
-      # Optional. The file must match the container architecture, e.g. Linux amd64 on x86_64 NAS.
-      # - ./bin/mihomo:/usr/local/bin/mihomo:ro

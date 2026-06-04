@@ -38,7 +38,7 @@ go run ./cmd/subagg -addr :8080
 
 ## Docker 一键部署
 
-推荐直接使用 GitHub Container Registry 镜像：
+推荐直接使用内置 Mihomo 的 GitHub Container Registry 镜像：
 
 ```bash
 mkdir -p sub-nest
@@ -53,8 +53,6 @@ docker compose up -d
 services:
   sub-nest:
     image: ghcr.io/davied-h/sub-nest:latest
-    container_name: sub-nest
-    restart: unless-stopped
     ports:
       - "18788:8080"
     volumes:
@@ -82,21 +80,36 @@ docker compose -f compose.local.yaml up -d --build
 
 ```text
 ghcr.io/davied-h/sub-nest:latest
-ghcr.io/davied-h/sub-nest:<version>
+ghcr.io/davied-h/sub-nest:v0.1.0
+ghcr.io/davied-h/sub-nest:slim
+ghcr.io/davied-h/sub-nest:v0.1.0-slim
 ```
 
-如果需要真实出口检测，把 Linux 可执行的 Mihomo/Clash 核心挂载到容器：
+`latest` 和版本镜像内置 Mihomo，可直接进行真实出口检测。`slim` 和版本 `slim` 镜像不内置 Mihomo，适合想自己挂载 core 的用户：
 
 ```yaml
-environment:
-  SUBAGG_MIHOMO_BIN: /usr/local/bin/mihomo
-volumes:
-  - ./bin/mihomo:/usr/local/bin/mihomo:ro
+services:
+  sub-nest:
+    image: ghcr.io/davied-h/sub-nest:slim
+    ports:
+      - "18788:8080"
+    environment:
+      SUBAGG_MIHOMO_BIN: /usr/local/bin/mihomo
+    volumes:
+      - ./data:/data
+      - ./bin/mihomo:/usr/local/bin/mihomo:ro
 ```
 
 没有 core 时应用仍可运行，刷新订阅源时会跳过真实出口检测。
 
-注意：`./bin/mihomo` 必须匹配容器架构。例如 x86_64 NAS 需要 Linux amd64，可不要把 macOS `darwin arm64` 的本地开发版同步到 NAS，否则节点检测会报 `exec format error`。
+注意：`./bin/mihomo` 必须匹配容器架构。例如 x86_64 NAS 需要 Linux amd64，不要把 macOS `darwin arm64` 的本地开发版同步到 NAS，否则节点检测会报 `exec format error`。
+
+如果要本地手动构建同样的镜像矩阵：
+
+```bash
+docker build -t ghcr.io/davied-h/sub-nest:latest .
+docker build --target slim -t ghcr.io/davied-h/sub-nest:slim .
+```
 
 ## NAS 部署
 
