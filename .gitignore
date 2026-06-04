@@ -1,0 +1,9 @@
+data/
+bin/
+web/node_modules/
+web/dist/
+web/.vite/
+build/
+deploy-root/
+.DS_Store
+*.log

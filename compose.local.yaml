@@ -1,0 +1,17 @@
+services:
+  sub-nest:
+    build:
+      context: .
+    image: sub-nest:local
+    container_name: sub-nest
+    restart: unless-stopped
+    environment:
+      SUBAGG_ADDR: ":8080"
+      SUBAGG_DATA: "/data/config.json"
+      SUBAGG_STATIC: "/app/web/dist"
+      SUBAGG_MIHOMO_BIN: "/usr/local/bin/mihomo"
+    ports:
+      - "18788:8080"
+    volumes:
+      - ./data:/data
+      - ./bin/mihomo:/usr/local/bin/mihomo:ro
