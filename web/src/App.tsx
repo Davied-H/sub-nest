@@ -264,6 +264,7 @@ function App() {
   const api = useMemo(() => createAPI(token), [token])
   const authenticated = Boolean(token)
   const anyRefreshing = sources.some((source) => source.lastStatus === "refreshing")
+  const publicBase = window.location.origin
 
   const loadProtected = useCallback(async (options?: { silent?: boolean }) => {
     if (!token) {
@@ -412,7 +413,7 @@ function App() {
             </div>
 
             <TabsContent value="overview">
-              <Overview dashboard={dashboard} loading={loading} outputs={outputs} />
+              <Overview dashboard={dashboard} loading={loading} outputs={outputs} publicBase={publicBase} />
             </TabsContent>
             <TabsContent value="sources">
               <SourcesView
@@ -431,7 +432,7 @@ function App() {
                 sources={sources}
                 loading={loading}
                 reload={loadProtected}
-                publicBase={dashboard?.publicExampleUrl.replace(/\/s\/main$/, "") ?? window.location.origin}
+                publicBase={publicBase}
               />
             </TabsContent>
             <TabsContent value="preview">
@@ -463,7 +464,6 @@ function AuthScreen({
   onSubmit: (token: string, setup: boolean, publicBaseURL: string) => void
 }) {
   const [rawToken, setRawToken] = useState("")
-  const [publicBaseURL, setPublicBaseURL] = useState(window.location.origin)
 
   return (
     <main className="flex min-h-screen items-center justify-center bg-background p-4">
@@ -489,24 +489,13 @@ function AuthScreen({
                 placeholder="至少 8 位"
               />
             </Field>
-            {setup ? (
-              <Field>
-                <FieldLabel htmlFor="public-base">公开访问域名</FieldLabel>
-                <Input
-                  id="public-base"
-                  value={publicBaseURL}
-                  onChange={(event) => setPublicBaseURL(event.target.value)}
-                />
-                <FieldDescription>用于生成复制链接，可稍后在配置文件中调整。</FieldDescription>
-              </Field>
-            ) : null}
           </FieldGroup>
         </CardContent>
         <CardFooter>
           <Button
             className="w-full"
             disabled={busy || rawToken.length < 8}
-            onClick={() => onSubmit(rawToken, setup, publicBaseURL)}
+            onClick={() => onSubmit(rawToken, setup, window.location.origin)}
           >
             {busy ? <Loader2Icon data-icon="inline-start" /> : <ShieldIcon data-icon="inline-start" />}
             {setup ? "完成初始化" : "进入后台"}
@@ -521,10 +510,12 @@ function Overview({
   dashboard,
   loading,
   outputs,
+  publicBase,
 }: {
   dashboard: Dashboard | null
   loading: boolean
   outputs: Output[]
+  publicBase: string
 }) {
   const stats = [
     { label: "公开订阅", value: dashboard?.outputCount ?? 0, sub: `${dashboard?.enabledOutputs ?? 0} 个启用` },
@@ -568,10 +559,10 @@ function Overview({
                     <StatusBadge status={output.enabled ? "ok" : "paused"} />
                   </div>
                   <p className="truncate text-sm text-muted-foreground">
-                    {window.location.origin}/s/{output.slug}
+                    {publicBase}/s/{output.slug}
                   </p>
                 </div>
-                <Button variant="outline" size="sm" onClick={() => copyText(`${window.location.origin}/s/${output.slug}`, "订阅地址已复制")}>
+                <Button variant="outline" size="sm" onClick={() => copyText(`${publicBase}/s/${output.slug}`, "订阅地址已复制")}>
                   <ClipboardIcon data-icon="inline-start" />
                   复制
                 </Button>

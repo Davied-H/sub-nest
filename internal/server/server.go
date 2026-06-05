@@ -157,10 +157,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 			dashboard.EnabledOutputs++
 		}
 	}
-	base := cfg.Settings.PublicBaseURL
-	if base == "" {
-		base = originFromRequest(r)
-	}
+	base := originFromRequest(r)
 	dashboard.PublicExampleURL = strings.TrimRight(base, "/") + "/s/main"
 	writeJSON(w, http.StatusOK, dashboard)
 }
