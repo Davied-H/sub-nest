@@ -73,8 +73,14 @@ type Node struct {
 
 type Settings struct {
 	AdminTokenHash string `json:"adminTokenHash"`
+	UserTokenHash  string `json:"userTokenHash"`
 	PublicBaseURL  string `json:"publicBaseUrl"`
 	RefreshMinutes int    `json:"refreshMinutes"`
+}
+
+type SettingsView struct {
+	PublicBaseURL string `json:"publicBaseUrl"`
+	HasUserToken  bool   `json:"hasUserToken"`
 }
 
 type Config struct {

@@ -46,6 +46,9 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /s/{slug}", s.handlePublicSubscription)
 
 	mux.Handle("GET /api/dashboard", s.auth(http.HandlerFunc(s.handleDashboard)))
+	mux.Handle("GET /api/settings", s.auth(http.HandlerFunc(s.handleSettings)))
+	mux.Handle("PUT /api/settings/admin-token", s.auth(http.HandlerFunc(s.handleUpdateAdminToken)))
+	mux.Handle("PUT /api/settings/user-token", s.auth(http.HandlerFunc(s.handleUpdateUserToken)))
 	mux.Handle("GET /api/sources", s.auth(http.HandlerFunc(s.handleSources)))
 	mux.Handle("POST /api/sources", s.auth(http.HandlerFunc(s.handleCreateSource)))
 	mux.Handle("PUT /api/sources/{id}", s.auth(http.HandlerFunc(s.handleUpdateSource)))
@@ -88,13 +91,10 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "请求格式错误")
 		return
 	}
-	if len(req.Token) < 8 {
-		writeError(w, http.StatusBadRequest, "token 至少需要 8 位")
-		return
-	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(req.Token), bcrypt.DefaultCost)
+	token := strings.TrimSpace(req.Token)
+	hash, err := hashToken(token)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "token 保存失败")
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	err = s.store.Update(func(cfg *domain.Config) error {
@@ -106,7 +106,7 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "配置保存失败")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"token": issueSessionToken(req.Token)})
+	writeJSON(w, http.StatusOK, map[string]string{"token": issueSessionToken(token)})
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -122,11 +122,88 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusPreconditionRequired, "需要先初始化管理员 token")
 		return
 	}
-	if bcrypt.CompareHashAndPassword([]byte(cfg.Settings.AdminTokenHash), []byte(req.Token)) != nil {
+	token := strings.TrimSpace(req.Token)
+	if bcrypt.CompareHashAndPassword([]byte(cfg.Settings.AdminTokenHash), []byte(token)) != nil {
 		writeError(w, http.StatusUnauthorized, "token 不正确")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"token": issueSessionToken(req.Token)})
+	writeJSON(w, http.StatusOK, map[string]string{"token": issueSessionToken(token)})
+}
+
+func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
+	cfg := s.store.Snapshot()
+	writeJSON(w, http.StatusOK, domain.SettingsView{
+		PublicBaseURL: cfg.Settings.PublicBaseURL,
+		HasUserToken:  cfg.Settings.UserTokenHash != "",
+	})
+}
+
+func (s *Server) handleUpdateAdminToken(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		CurrentToken string `json:"currentToken"`
+		NewToken     string `json:"newToken"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	currentToken := strings.TrimSpace(req.CurrentToken)
+	newToken := strings.TrimSpace(req.NewToken)
+	cfg := s.store.Snapshot()
+	if bcrypt.CompareHashAndPassword([]byte(cfg.Settings.AdminTokenHash), []byte(currentToken)) != nil {
+		writeError(w, http.StatusUnauthorized, "当前管理员 token 不正确")
+		return
+	}
+	hash, err := hashToken(newToken)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(currentToken)) == nil {
+		writeError(w, http.StatusBadRequest, "新 token 不能与当前 token 相同")
+		return
+	}
+	err = s.store.Update(func(cfg *domain.Config) error {
+		cfg.Settings.AdminTokenHash = string(hash)
+		return nil
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "管理员 token 保存失败")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"token": issueSessionToken(newToken)})
+}
+
+func (s *Server) handleUpdateUserToken(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Token string `json:"token"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	token := strings.TrimSpace(req.Token)
+	var hash []byte
+	var err error
+	if token != "" {
+		hash, err = hashToken(token)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	err = s.store.Update(func(cfg *domain.Config) error {
+		cfg.Settings.UserTokenHash = string(hash)
+		return nil
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "用户 token 保存失败")
+		return
+	}
+	writeJSON(w, http.StatusOK, domain.SettingsView{
+		PublicBaseURL: s.store.Snapshot().Settings.PublicBaseURL,
+		HasUserToken:  token != "",
+	})
 }
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
@@ -426,6 +503,13 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handlePublicSubscription(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
 	cfg := s.store.Snapshot()
+	if cfg.Settings.UserTokenHash != "" {
+		token := subscriptionTokenFromRequest(r)
+		if bcrypt.CompareHashAndPassword([]byte(cfg.Settings.UserTokenHash), []byte(token)) != nil {
+			writeError(w, http.StatusUnauthorized, "订阅 token 不正确")
+			return
+		}
+	}
 	for _, output := range cfg.Outputs {
 		if output.Slug != slug {
 			continue
@@ -637,6 +721,22 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 
 func issueSessionToken(raw string) string {
 	return "local:" + raw
+}
+
+func hashToken(raw string) ([]byte, error) {
+	raw = strings.TrimSpace(raw)
+	if len(raw) < 8 {
+		return nil, errors.New("token 至少需要 8 位")
+	}
+	return bcrypt.GenerateFromPassword([]byte(raw), bcrypt.DefaultCost)
+}
+
+func subscriptionTokenFromRequest(r *http.Request) string {
+	if token := strings.TrimSpace(r.URL.Query().Get("token")); token != "" {
+		return token
+	}
+	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	return strings.TrimSpace(token)
 }
 
 func decodeJSON(r *http.Request, v interface{}) error {

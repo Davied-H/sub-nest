@@ -199,6 +199,11 @@ type Health = {
   needsAdminSetup: boolean
 }
 
+type Settings = {
+  publicBaseUrl: string
+  hasUserToken: boolean
+}
+
 const defaultSource: Source = {
   id: "",
   name: "",
@@ -257,6 +262,8 @@ function App() {
   const [sources, setSources] = useState<Source[]>([])
   const [outputs, setOutputs] = useState<Output[]>([])
   const [preview, setPreview] = useState<Preview | null>(null)
+  const [settings, setSettings] = useState<Settings | null>(null)
+  const [userToken, setUserToken] = useState(() => localStorage.getItem("sub-nest-user-token") ?? "")
   const [activeTab, setActiveTab] = useState("overview")
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState("")
@@ -274,14 +281,20 @@ function App() {
       setLoading(true)
     }
     try {
-      const [nextDashboard, nextSources, nextOutputs] = await Promise.all([
+      const [nextDashboard, nextSources, nextOutputs, nextSettings] = await Promise.all([
         api.get<Dashboard>("/api/dashboard"),
         api.get<Source[]>("/api/sources?includeUrl=1"),
         api.get<Output[]>("/api/outputs"),
+        api.get<Settings>("/api/settings"),
       ])
       setDashboard(nextDashboard)
       setSources(nextSources)
       setOutputs(nextOutputs)
+      setSettings(nextSettings)
+      if (!nextSettings.hasUserToken && userToken) {
+        localStorage.removeItem("sub-nest-user-token")
+        setUserToken("")
+      }
       if (nextOutputs[0]) {
         try {
           setPreview(await api.get<Preview>(`/api/outputs/${nextOutputs[0].id}/preview`))
@@ -299,7 +312,7 @@ function App() {
         setLoading(false)
       }
     }
-  }, [api, token])
+  }, [api, token, userToken])
 
   useEffect(() => {
     createAPI("").get<Health>("/api/health").then(setHealth).catch(() => {
@@ -409,11 +422,12 @@ function App() {
                 <TabsTrigger value="outputs">公开订阅</TabsTrigger>
                 <TabsTrigger value="preview">预览</TabsTrigger>
                 <TabsTrigger value="backup">备份</TabsTrigger>
+                <TabsTrigger value="settings">设置</TabsTrigger>
               </TabsList>
             </div>
 
             <TabsContent value="overview">
-              <Overview dashboard={dashboard} loading={loading} outputs={outputs} publicBase={publicBase} />
+              <Overview dashboard={dashboard} loading={loading} outputs={outputs} publicBase={publicBase} userToken={userToken} />
             </TabsContent>
             <TabsContent value="sources">
               <SourcesView
@@ -433,6 +447,7 @@ function App() {
                 loading={loading}
                 reload={loadProtected}
                 publicBase={publicBase}
+                userToken={userToken}
               />
             </TabsContent>
             <TabsContent value="preview">
@@ -445,6 +460,28 @@ function App() {
             </TabsContent>
             <TabsContent value="backup">
               <BackupView api={api} reload={loadProtected} />
+            </TabsContent>
+            <TabsContent value="settings">
+              <SettingsView
+                api={api}
+                settings={settings}
+                userToken={userToken}
+                onAdminTokenUpdated={(nextToken) => {
+                  localStorage.setItem("sub-nest-token", nextToken)
+                  localStorage.removeItem("subagg-token")
+                  setToken(nextToken)
+                }}
+                onUserTokenUpdated={(nextSettings, nextUserToken) => {
+                  setSettings(nextSettings)
+                  if (nextUserToken) {
+                    localStorage.setItem("sub-nest-user-token", nextUserToken)
+                    setUserToken(nextUserToken)
+                  } else {
+                    localStorage.removeItem("sub-nest-user-token")
+                    setUserToken("")
+                  }
+                }}
+              />
             </TabsContent>
           </Tabs>
         </div>
@@ -511,11 +548,13 @@ function Overview({
   loading,
   outputs,
   publicBase,
+  userToken,
 }: {
   dashboard: Dashboard | null
   loading: boolean
   outputs: Output[]
   publicBase: string
+  userToken: string
 }) {
   const stats = [
     { label: "公开订阅", value: dashboard?.outputCount ?? 0, sub: `${dashboard?.enabledOutputs ?? 0} 个启用` },
@@ -559,10 +598,10 @@ function Overview({
                     <StatusBadge status={output.enabled ? "ok" : "paused"} />
                   </div>
                   <p className="truncate text-sm text-muted-foreground">
-                    {publicBase}/s/{output.slug}
+                    {subscriptionURL(publicBase, output.slug, userToken)}
                   </p>
                 </div>
-                <Button variant="outline" size="sm" onClick={() => copyText(`${publicBase}/s/${output.slug}`, "订阅地址已复制")}>
+                <Button variant="outline" size="sm" onClick={() => copyText(subscriptionURL(publicBase, output.slug, userToken), "订阅地址已复制")}>
                   <ClipboardIcon data-icon="inline-start" />
                   复制
                 </Button>
@@ -966,6 +1005,7 @@ function OutputsView({
   loading,
   reload,
   publicBase,
+  userToken,
 }: {
   api: API
   outputs: Output[]
@@ -973,6 +1013,7 @@ function OutputsView({
   loading: boolean
   reload: () => Promise<void>
   publicBase: string
+  userToken: string
 }) {
   const [editing, setEditing] = useState<Output | null>(null)
   const preparedDefault = { ...defaultOutput, sourceIds: sources.map((source) => source.id) }
@@ -1021,7 +1062,7 @@ function OutputsView({
         ) : (
           <div className="grid gap-3 lg:grid-cols-2">
             {outputs.map((output) => {
-              const url = `${publicBase}/s/${output.slug}`
+              const url = subscriptionURL(publicBase, output.slug, userToken)
               return (
                 <Card key={output.id}>
                   <CardHeader>
@@ -1526,6 +1567,172 @@ function BackupView({ api, reload }: { api: API; reload: () => Promise<void> }) 
   )
 }
 
+function SettingsView({
+  api,
+  settings,
+  userToken,
+  onAdminTokenUpdated,
+  onUserTokenUpdated,
+}: {
+  api: API
+  settings: Settings | null
+  userToken: string
+  onAdminTokenUpdated: (token: string) => void
+  onUserTokenUpdated: (settings: Settings, userToken: string) => void
+}) {
+  const [currentAdminToken, setCurrentAdminToken] = useState("")
+  const [newAdminToken, setNewAdminToken] = useState("")
+  const [confirmAdminToken, setConfirmAdminToken] = useState("")
+  const [userTokenDraft, setUserTokenDraft] = useState(userToken)
+  const [busy, setBusy] = useState("")
+
+  useEffect(() => {
+    setUserTokenDraft(userToken)
+  }, [userToken])
+
+  async function updateAdminToken() {
+    if (newAdminToken !== confirmAdminToken) {
+      toast.error("两次输入的新管理员 token 不一致")
+      return
+    }
+    setBusy("admin-token")
+    try {
+      const response = await api.put<{ token: string }>("/api/settings/admin-token", {
+        currentToken: currentAdminToken,
+        newToken: newAdminToken,
+      })
+      onAdminTokenUpdated(response.token)
+      setCurrentAdminToken("")
+      setNewAdminToken("")
+      setConfirmAdminToken("")
+      toast.success("管理员 token 已修改")
+    } catch (error) {
+      toast.error(messageOf(error))
+    } finally {
+      setBusy("")
+    }
+  }
+
+  async function updateUserToken(nextToken = userTokenDraft.trim()) {
+    setBusy("user-token")
+    try {
+      const nextSettings = await api.put<Settings>("/api/settings/user-token", { token: nextToken })
+      onUserTokenUpdated(nextSettings, nextToken)
+      setUserTokenDraft(nextToken)
+      toast.success(nextToken ? "用户 token 已保存" : "用户 token 已清空")
+    } catch (error) {
+      toast.error(messageOf(error))
+    } finally {
+      setBusy("")
+    }
+  }
+
+  const userTokenEnabled = settings?.hasUserToken ?? false
+  const canSaveAdminToken = currentAdminToken.length >= 8 && newAdminToken.length >= 8 && confirmAdminToken.length >= 8
+  const canSaveUserToken = userTokenDraft.trim().length >= 8
+
+  return (
+    <div className="grid gap-4 lg:grid-cols-2">
+      <Card>
+        <CardHeader>
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <CardTitle>管理员 token</CardTitle>
+              <CardDescription>用于登录后台和管理配置，修改后当前浏览器会自动换成新会话。</CardDescription>
+            </div>
+            <Badge variant="secondary"><ShieldIcon />后台</Badge>
+          </div>
+        </CardHeader>
+        <CardContent>
+          <FieldGroup>
+            <Field>
+              <FieldLabel htmlFor="current-admin-token">当前管理员 token</FieldLabel>
+              <Input
+                id="current-admin-token"
+                type="password"
+                value={currentAdminToken}
+                onChange={(event) => setCurrentAdminToken(event.target.value)}
+                placeholder="输入当前 token"
+              />
+            </Field>
+            <Field>
+              <FieldLabel htmlFor="new-admin-token">新管理员 token</FieldLabel>
+              <Input
+                id="new-admin-token"
+                type="password"
+                value={newAdminToken}
+                onChange={(event) => setNewAdminToken(event.target.value)}
+                placeholder="至少 8 位"
+              />
+            </Field>
+            <Field>
+              <FieldLabel htmlFor="confirm-admin-token">确认新 token</FieldLabel>
+              <Input
+                id="confirm-admin-token"
+                type="password"
+                value={confirmAdminToken}
+                onChange={(event) => setConfirmAdminToken(event.target.value)}
+                placeholder="再次输入新 token"
+              />
+            </Field>
+          </FieldGroup>
+        </CardContent>
+        <CardFooter>
+          <Button disabled={busy === "admin-token" || !canSaveAdminToken} onClick={updateAdminToken}>
+            {busy === "admin-token" ? <Loader2Icon data-icon="inline-start" /> : <SaveIcon data-icon="inline-start" />}
+            修改管理员 token
+          </Button>
+        </CardFooter>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <CardTitle>用户 token</CardTitle>
+              <CardDescription>用于保护 /s/slug 公开订阅地址，清空后恢复无需 token 访问。</CardDescription>
+            </div>
+            <Badge variant={userTokenEnabled ? "secondary" : "outline"}>
+              <LockIcon />
+              {userTokenEnabled ? "已启用" : "未启用"}
+            </Badge>
+          </div>
+        </CardHeader>
+        <CardContent>
+          <FieldGroup>
+            <Field>
+              <FieldLabel htmlFor="user-token">公开订阅用户 token</FieldLabel>
+              <Input
+                id="user-token"
+                type="password"
+                value={userTokenDraft}
+                onChange={(event) => setUserTokenDraft(event.target.value)}
+                placeholder={userTokenEnabled ? "输入新的用户 token" : "至少 8 位"}
+              />
+              <FieldDescription>
+                {userTokenEnabled
+                  ? userToken
+                    ? "本浏览器已保存用户 token，复制订阅地址时会自动带上。"
+                    : "服务端已启用用户 token；如需复制可用链接，请在这里重新输入并保存。"
+                  : "未设置时公开订阅地址保持原来的直接访问方式。"}
+              </FieldDescription>
+            </Field>
+          </FieldGroup>
+        </CardContent>
+        <CardFooter className="flex flex-wrap gap-2">
+          <Button disabled={busy === "user-token" || !canSaveUserToken} onClick={() => updateUserToken()}>
+            {busy === "user-token" ? <Loader2Icon data-icon="inline-start" /> : <SaveIcon data-icon="inline-start" />}
+            保存用户 token
+          </Button>
+          <Button variant="outline" disabled={busy === "user-token" || !userTokenEnabled} onClick={() => updateUserToken("")}>
+            清空用户 token
+          </Button>
+        </CardFooter>
+      </Card>
+    </div>
+  )
+}
+
 function Metric({ label, value }: { label: string; value: string | number }) {
   return (
     <div className="rounded-lg border p-3">
@@ -1649,6 +1856,15 @@ async function copyText(value: string, message = "已复制") {
       toast.error(messageOf(error))
     }
   }
+}
+
+function subscriptionURL(publicBase: string, slug: string, userToken = "") {
+  const url = new URL(`/s/${slug}`, publicBase)
+  const token = userToken.trim()
+  if (token) {
+    url.searchParams.set("token", token)
+  }
+  return url.toString()
 }
 
 function downloadSubscription(baseURL: string, slug: string, format: string) {
