@@ -482,10 +482,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 			dashboard.EnabledOutputs++
 		}
 	}
-	base := cfg.Settings.PublicBaseURL
-	if base == "" {
-		base = originFromRequest(r)
-	}
+	base := originFromRequest(r)
 	if ownerSlug == "admin" {
 		dashboard.PublicExampleURL = strings.TrimRight(base, "/") + "/s/main"
 	} else {

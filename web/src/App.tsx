@@ -543,7 +543,7 @@ function App() {
                 dashboard={dashboard}
                 loading={loading}
                 outputs={outputs}
-                publicBase={publicBaseFromExample(dashboard?.publicExampleUrl)}
+                publicExampleUrl={dashboard?.publicExampleUrl}
                 userToken={userToken}
               />
             </TabsContent>
@@ -566,7 +566,7 @@ function App() {
                 loading={loading}
                 scopeQuery={scopeQuery}
                 reload={loadProtected}
-                publicBase={publicBaseFromExample(dashboard?.publicExampleUrl)}
+                publicExampleUrl={dashboard?.publicExampleUrl}
                 userToken={userToken}
               />
             </TabsContent>
@@ -723,13 +723,13 @@ function Overview({
   dashboard,
   loading,
   outputs,
-  publicBase,
+  publicExampleUrl,
   userToken,
 }: {
   dashboard: Dashboard | null
   loading: boolean
   outputs: Output[]
-  publicBase: string
+  publicExampleUrl?: string
   userToken: string
 }) {
   const stats = [
@@ -766,23 +766,26 @@ function Overview({
               <AlertDescription>进入“公开订阅”创建 `main` 后即可复制地址到 Clash / Mihomo。</AlertDescription>
             </Alert>
           ) : (
-            outputs.map((output) => (
-              <div key={output.id} className="flex flex-col gap-2 rounded-lg border p-3 sm:flex-row sm:items-center sm:justify-between">
+            outputs.map((output) => {
+              const url = subscriptionURL(publicExampleUrl, output.slug, userToken)
+              return (
+                <div key={output.id} className="flex flex-col gap-2 rounded-lg border p-3 sm:flex-row sm:items-center sm:justify-between">
                 <div className="min-w-0">
                   <div className="flex items-center gap-2">
                     <p className="truncate font-medium">{output.name}</p>
                     <StatusBadge status={output.enabled ? "ok" : "paused"} />
                   </div>
                   <p className="truncate text-sm text-muted-foreground">
-                    {subscriptionURL(publicBase, output.slug, userToken)}
+                    {url}
                   </p>
                 </div>
-                <Button variant="outline" size="sm" onClick={() => copyText(subscriptionURL(publicBase, output.slug, userToken), "订阅地址已复制")}>
+                <Button variant="outline" size="sm" onClick={() => copyText(url, "订阅地址已复制")}>
                   <ClipboardIcon data-icon="inline-start" />
                   复制
                 </Button>
               </div>
-            ))
+              )
+            })
           )}
         </CardContent>
       </Card>
@@ -1183,7 +1186,7 @@ function OutputsView({
   loading,
   scopeQuery,
   reload,
-  publicBase,
+  publicExampleUrl,
   userToken,
 }: {
   api: API
@@ -1192,7 +1195,7 @@ function OutputsView({
   loading: boolean
   scopeQuery: string
   reload: () => Promise<void>
-  publicBase: string
+  publicExampleUrl?: string
   userToken: string
 }) {
   const [editing, setEditing] = useState<Output | null>(null)
@@ -1242,7 +1245,7 @@ function OutputsView({
         ) : (
           <div className="grid gap-3 lg:grid-cols-2">
             {outputs.map((output) => {
-              const url = subscriptionURL(publicBase, output.slug, userToken)
+              const url = subscriptionURL(publicExampleUrl, output.slug, userToken)
               return (
                 <Card key={output.id}>
                   <CardHeader>
@@ -2154,17 +2157,6 @@ function withScope(path: string, scopeQuery: string) {
   return `${base}?${[query, scope].filter(Boolean).join("&")}`
 }
 
-function publicBaseFromExample(example?: string) {
-  if (!example) {
-    return window.location.origin
-  }
-  const userScoped = example.match(/^(.*\/u\/[^/]+)\/s\/[^/]+$/)
-  if (userScoped) {
-    return userScoped[1]
-  }
-  return example.replace(/\/s\/[^/]+$/, "")
-}
-
 async function request<T>(path: string, init: RequestInit, token: string): Promise<T> {
   const response = await fetch(path, {
     ...init,
@@ -2225,8 +2217,18 @@ async function copyText(value: string, message = "已复制") {
   }
 }
 
-function subscriptionURL(publicBase: string, slug: string, userToken = "") {
-  const url = new URL(`/s/${slug}`, publicBase)
+function subscriptionURL(publicExampleUrl: string | undefined, slug: string, userToken = "") {
+  let url: URL
+  try {
+    url = new URL(publicExampleUrl || "/s/main", window.location.origin)
+  } catch {
+    url = new URL("/s/main", window.location.origin)
+  }
+  const browserOrigin = new URL(window.location.origin)
+  url.protocol = browserOrigin.protocol
+  url.host = browserOrigin.host
+  url.pathname = url.pathname.replace(/\/s\/[^/]*$/, `/s/${slug}`)
+  url.search = ""
   const token = userToken.trim()
   if (token) {
     url.searchParams.set("token", token)
