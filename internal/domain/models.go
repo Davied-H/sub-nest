@@ -4,6 +4,7 @@ import "time"
 
 type Source struct {
 	ID              string     `json:"id"`
+	OwnerUserID     string     `json:"ownerUserId,omitempty"`
 	Name            string     `json:"name"`
 	URL             string     `json:"url"`
 	SourceType      string     `json:"sourceType,omitempty"`
@@ -25,6 +26,7 @@ type Source struct {
 
 type Output struct {
 	ID                string            `json:"id"`
+	OwnerUserID       string            `json:"ownerUserId,omitempty"`
 	Slug              string            `json:"slug"`
 	Name              string            `json:"name"`
 	Enabled           bool              `json:"enabled"`
@@ -83,12 +85,35 @@ type SettingsView struct {
 	HasUserToken  bool   `json:"hasUserToken"`
 }
 
+type User struct {
+	ID          string     `json:"id"`
+	Slug        string     `json:"slug"`
+	Name        string     `json:"name"`
+	TokenHash   string     `json:"tokenHash,omitempty"`
+	Role        string     `json:"role"`
+	Enabled     bool       `json:"enabled"`
+	CreatedAt   time.Time  `json:"createdAt"`
+	LastLoginAt *time.Time `json:"lastLoginAt,omitempty"`
+}
+
+type InviteCode struct {
+	ID               string     `json:"id"`
+	CodeHash         string     `json:"codeHash,omitempty"`
+	Label            string     `json:"label"`
+	CreatedAt        time.Time  `json:"createdAt"`
+	UsedAt           *time.Time `json:"usedAt,omitempty"`
+	UsedByUserID     string     `json:"usedByUserId,omitempty"`
+	CreatedByAdminID string     `json:"createdByAdminId"`
+}
+
 type Config struct {
-	Version  int       `json:"version"`
-	Settings Settings  `json:"settings"`
-	Sources  []Source  `json:"sources"`
-	Outputs  []Output  `json:"outputs"`
-	Updated  time.Time `json:"updated"`
+	Version     int          `json:"version"`
+	Settings    Settings     `json:"settings"`
+	Users       []User       `json:"users"`
+	InviteCodes []InviteCode `json:"inviteCodes"`
+	Sources     []Source     `json:"sources"`
+	Outputs     []Output     `json:"outputs"`
+	Updated     time.Time    `json:"updated"`
 }
 
 type SourceView struct {

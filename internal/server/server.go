@@ -1,7 +1,9 @@
 package server
 
 import (
+	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -29,6 +31,14 @@ type Server struct {
 	logger     *slog.Logger
 }
 
+type principal struct {
+	User domain.User
+}
+
+type contextKey string
+
+const principalContextKey contextKey = "principal"
+
 func New(st *store.Store, staticPath string, logger *slog.Logger) *Server {
 	return &Server{
 		store:      st,
@@ -43,12 +53,20 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /api/health", s.handleHealth)
 	mux.HandleFunc("POST /api/setup", s.handleSetup)
 	mux.HandleFunc("POST /api/login", s.handleLogin)
+	mux.HandleFunc("POST /api/register", s.handleRegister)
 	mux.HandleFunc("GET /s/{slug}", s.handlePublicSubscription)
+	mux.HandleFunc("GET /u/{userSlug}/s/{slug}", s.handleUserPublicSubscription)
+
+	mux.Handle("GET /api/me", s.auth(http.HandlerFunc(s.handleMe)))
+	mux.Handle("POST /api/admin/invite-codes", s.authAdmin(http.HandlerFunc(s.handleCreateInviteCode)))
+	mux.Handle("GET /api/admin/invite-codes", s.authAdmin(http.HandlerFunc(s.handleInviteCodes)))
+	mux.Handle("GET /api/admin/users", s.authAdmin(http.HandlerFunc(s.handleUsers)))
+	mux.Handle("PUT /api/admin/users/{id}", s.authAdmin(http.HandlerFunc(s.handleUpdateUser)))
 
 	mux.Handle("GET /api/dashboard", s.auth(http.HandlerFunc(s.handleDashboard)))
 	mux.Handle("GET /api/settings", s.auth(http.HandlerFunc(s.handleSettings)))
-	mux.Handle("PUT /api/settings/admin-token", s.auth(http.HandlerFunc(s.handleUpdateAdminToken)))
-	mux.Handle("PUT /api/settings/user-token", s.auth(http.HandlerFunc(s.handleUpdateUserToken)))
+	mux.Handle("PUT /api/settings/admin-token", s.authAdmin(http.HandlerFunc(s.handleUpdateAdminToken)))
+	mux.Handle("PUT /api/settings/user-token", s.authAdmin(http.HandlerFunc(s.handleUpdateUserToken)))
 	mux.Handle("GET /api/sources", s.auth(http.HandlerFunc(s.handleSources)))
 	mux.Handle("POST /api/sources", s.auth(http.HandlerFunc(s.handleCreateSource)))
 	mux.Handle("PUT /api/sources/{id}", s.auth(http.HandlerFunc(s.handleUpdateSource)))
@@ -100,13 +118,14 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	err = s.store.Update(func(cfg *domain.Config) error {
 		cfg.Settings.AdminTokenHash = string(hash)
 		cfg.Settings.PublicBaseURL = strings.TrimRight(req.PublicBaseURL, "/")
+		ensureAdminUser(cfg)
 		return nil
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "配置保存失败")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"token": issueSessionToken(token)})
+	writeJSON(w, http.StatusOK, authResponse(issueSessionToken("admin", token), adminUser()))
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -123,11 +142,44 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token := strings.TrimSpace(req.Token)
-	if bcrypt.CompareHashAndPassword([]byte(cfg.Settings.AdminTokenHash), []byte(token)) != nil {
-		writeError(w, http.StatusUnauthorized, "token 不正确")
+	if bcrypt.CompareHashAndPassword([]byte(cfg.Settings.AdminTokenHash), []byte(token)) == nil {
+		now := time.Now()
+		_ = s.store.Update(func(cfg *domain.Config) error {
+			ensureAdminUser(cfg)
+			for i := range cfg.Users {
+				if cfg.Users[i].ID == "admin" {
+					cfg.Users[i].LastLoginAt = &now
+					return nil
+				}
+			}
+			return nil
+		})
+		user := findUser(s.store.Snapshot(), "admin")
+		writeJSON(w, http.StatusOK, authResponse(issueSessionToken("admin", token), user))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"token": issueSessionToken(token)})
+	for _, user := range cfg.Users {
+		if user.ID == "admin" || !user.Enabled || user.TokenHash == "" {
+			continue
+		}
+		if bcrypt.CompareHashAndPassword([]byte(user.TokenHash), []byte(token)) != nil {
+			continue
+		}
+		now := time.Now()
+		_ = s.store.Update(func(cfg *domain.Config) error {
+			for i := range cfg.Users {
+				if cfg.Users[i].ID == user.ID {
+					cfg.Users[i].LastLoginAt = &now
+					return nil
+				}
+			}
+			return nil
+		})
+		user.LastLoginAt = &now
+		writeJSON(w, http.StatusOK, authResponse(issueSessionToken(user.ID, token), user))
+		return
+	}
+	writeError(w, http.StatusUnauthorized, "token 不正确")
 }
 
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
@@ -171,7 +223,7 @@ func (s *Server) handleUpdateAdminToken(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusInternalServerError, "管理员 token 保存失败")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"token": issueSessionToken(newToken)})
+	writeJSON(w, http.StatusOK, authResponse(issueSessionToken("admin", newToken), findUser(s.store.Snapshot(), "admin")))
 }
 
 func (s *Server) handleUpdateUserToken(w http.ResponseWriter, r *http.Request) {
@@ -206,14 +258,206 @@ func (s *Server) handleUpdateUserToken(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		InviteCode string `json:"inviteCode"`
+		UserSlug   string `json:"userSlug"`
+		Token      string `json:"token"`
+		Name       string `json:"name"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	req.UserSlug = normalizeSlug(req.UserSlug)
+	req.Name = strings.TrimSpace(req.Name)
+	req.InviteCode = strings.TrimSpace(req.InviteCode)
+	if req.UserSlug == "" || req.UserSlug == "admin" {
+		writeError(w, http.StatusBadRequest, "用户标识格式不正确")
+		return
+	}
+	if len(req.Token) < 8 {
+		writeError(w, http.StatusBadRequest, "token 至少需要 8 位")
+		return
+	}
+	tokenHash, err := bcrypt.GenerateFromPassword([]byte(req.Token), bcrypt.DefaultCost)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "token 保存失败")
+		return
+	}
+	var created domain.User
+	err = s.store.Update(func(cfg *domain.Config) error {
+		if bcrypt.CompareHashAndPassword([]byte(cfg.Settings.AdminTokenHash), []byte(req.Token)) == nil {
+			return errors.New("token exists")
+		}
+		for _, user := range cfg.Users {
+			if user.Slug == req.UserSlug {
+				return errors.New("slug exists")
+			}
+			if user.TokenHash != "" && bcrypt.CompareHashAndPassword([]byte(user.TokenHash), []byte(req.Token)) == nil {
+				return errors.New("token exists")
+			}
+		}
+		inviteIndex := -1
+		for i := range cfg.InviteCodes {
+			if cfg.InviteCodes[i].UsedAt != nil {
+				continue
+			}
+			if bcrypt.CompareHashAndPassword([]byte(cfg.InviteCodes[i].CodeHash), []byte(req.InviteCode)) == nil {
+				inviteIndex = i
+				break
+			}
+		}
+		if inviteIndex < 0 {
+			return errors.New("invalid invite")
+		}
+		now := time.Now()
+		name := req.Name
+		if name == "" {
+			name = req.UserSlug
+		}
+		created = domain.User{
+			ID:          uuid.NewString(),
+			Slug:        req.UserSlug,
+			Name:        name,
+			TokenHash:   string(tokenHash),
+			Role:        "user",
+			Enabled:     true,
+			CreatedAt:   now,
+			LastLoginAt: &now,
+		}
+		cfg.Users = append(cfg.Users, created)
+		cfg.InviteCodes[inviteIndex].UsedAt = &now
+		cfg.InviteCodes[inviteIndex].UsedByUserID = created.ID
+		return nil
+	})
+	if err != nil {
+		switch err.Error() {
+		case "slug exists":
+			writeError(w, http.StatusConflict, "用户标识已存在")
+		case "invalid invite":
+			writeError(w, http.StatusUnauthorized, "授权码无效或已使用")
+		case "token exists":
+			writeError(w, http.StatusConflict, "token 已被使用，请换一个")
+		default:
+			writeError(w, http.StatusInternalServerError, "注册失败")
+		}
+		return
+	}
+	writeJSON(w, http.StatusCreated, authResponse(issueSessionToken(created.ID, req.Token), created))
+}
+
+func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]interface{}{"user": publicUser(currentPrincipal(r).User)})
+}
+
+func (s *Server) handleCreateInviteCode(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Label string `json:"label"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	code := RandomToken()
+	hash, err := bcrypt.GenerateFromPassword([]byte(code), bcrypt.DefaultCost)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "授权码生成失败")
+		return
+	}
+	invite := domain.InviteCode{
+		ID:               uuid.NewString(),
+		CodeHash:         string(hash),
+		Label:            strings.TrimSpace(req.Label),
+		CreatedAt:        time.Now(),
+		CreatedByAdminID: currentPrincipal(r).User.ID,
+	}
+	err = s.store.Update(func(cfg *domain.Config) error {
+		cfg.InviteCodes = append(cfg.InviteCodes, invite)
+		return nil
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "授权码保存失败")
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]interface{}{
+		"id":        invite.ID,
+		"code":      code,
+		"label":     invite.Label,
+		"createdAt": invite.CreatedAt,
+	})
+}
+
+func (s *Server) handleInviteCodes(w http.ResponseWriter, r *http.Request) {
+	cfg := s.store.Snapshot()
+	items := make([]map[string]interface{}, 0, len(cfg.InviteCodes))
+	for _, invite := range cfg.InviteCodes {
+		items = append(items, map[string]interface{}{
+			"id":           invite.ID,
+			"label":        invite.Label,
+			"createdAt":    invite.CreatedAt,
+			"usedAt":       invite.UsedAt,
+			"usedByUserId": invite.UsedByUserID,
+		})
+	}
+	writeJSON(w, http.StatusOK, items)
+}
+
+func (s *Server) handleUsers(w http.ResponseWriter, r *http.Request) {
+	cfg := s.store.Snapshot()
+	users := make([]map[string]interface{}, 0, len(cfg.Users))
+	for _, user := range cfg.Users {
+		users = append(users, publicUser(user))
+	}
+	writeJSON(w, http.StatusOK, users)
+}
+
+func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "admin" {
+		writeError(w, http.StatusBadRequest, "不能禁用 admin")
+		return
+	}
+	var req struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	var updated domain.User
+	err := s.store.Update(func(cfg *domain.Config) error {
+		for i := range cfg.Users {
+			if cfg.Users[i].ID == id {
+				cfg.Users[i].Enabled = req.Enabled
+				updated = cfg.Users[i]
+				return nil
+			}
+		}
+		return errors.New("not found")
+	})
+	if err != nil {
+		writeError(w, http.StatusNotFound, "用户不存在")
+		return
+	}
+	writeJSON(w, http.StatusOK, publicUser(updated))
+}
+
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
+	ownerID, ownerSlug, ok := s.resolveOwner(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "token 不正确")
+		return
+	}
 	cfg := s.store.Snapshot()
 	dashboard := domain.Dashboard{
-		SourceCount:     len(cfg.Sources),
-		OutputCount:     len(cfg.Outputs),
 		NeedsAdminSetup: cfg.Settings.AdminTokenHash == "",
 	}
 	for _, source := range cfg.Sources {
+		if source.OwnerUserID != ownerID {
+			continue
+		}
+		dashboard.SourceCount++
 		if source.Enabled {
 			dashboard.EnabledSources++
 		}
@@ -230,32 +474,57 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	for _, output := range cfg.Outputs {
+		if output.OwnerUserID != ownerID {
+			continue
+		}
+		dashboard.OutputCount++
 		if output.Enabled {
 			dashboard.EnabledOutputs++
 		}
 	}
-	base := originFromRequest(r)
-	dashboard.PublicExampleURL = strings.TrimRight(base, "/") + "/s/main"
+	base := cfg.Settings.PublicBaseURL
+	if base == "" {
+		base = originFromRequest(r)
+	}
+	if ownerSlug == "admin" {
+		dashboard.PublicExampleURL = strings.TrimRight(base, "/") + "/s/main"
+	} else {
+		dashboard.PublicExampleURL = strings.TrimRight(base, "/") + "/u/" + ownerSlug + "/s/main"
+	}
 	writeJSON(w, http.StatusOK, dashboard)
 }
 
 func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
+	ownerID, _, ok := s.resolveOwner(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "用户不存在或已禁用")
+		return
+	}
 	cfg := s.store.Snapshot()
 	includeURL := r.URL.Query().Get("includeUrl") == "1"
 	views := make([]domain.SourceView, 0, len(cfg.Sources))
 	for _, source := range cfg.Sources {
+		if source.OwnerUserID != ownerID {
+			continue
+		}
 		views = append(views, domain.SourceToView(source, includeURL))
 	}
 	writeJSON(w, http.StatusOK, views)
 }
 
 func (s *Server) handleCreateSource(w http.ResponseWriter, r *http.Request) {
+	ownerID, _, ok := s.resolveOwner(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "用户不存在或已禁用")
+		return
+	}
 	var req domain.Source
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "请求格式错误")
 		return
 	}
 	req.ID = uuid.NewString()
+	req.OwnerUserID = ownerID
 	normalizeSourceInput(&req)
 	if !sourceInputReady(req) {
 		writeError(w, http.StatusBadRequest, "名称和订阅来源不能为空")
@@ -276,6 +545,11 @@ func (s *Server) handleCreateSource(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUpdateSource(w http.ResponseWriter, r *http.Request) {
+	ownerID, _, ok := s.resolveOwner(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "用户不存在或已禁用")
+		return
+	}
 	id := r.PathValue("id")
 	var req domain.Source
 	if err := decodeJSON(r, &req); err != nil {
@@ -290,7 +564,7 @@ func (s *Server) handleUpdateSource(w http.ResponseWriter, r *http.Request) {
 	var updated domain.Source
 	err := s.store.Update(func(cfg *domain.Config) error {
 		for i := range cfg.Sources {
-			if cfg.Sources[i].ID == id {
+			if cfg.Sources[i].ID == id && cfg.Sources[i].OwnerUserID == ownerID {
 				cfg.Sources[i].Name = req.Name
 				cfg.Sources[i].URL = req.URL
 				cfg.Sources[i].SourceType = req.SourceType
@@ -336,12 +610,17 @@ func sourceInputReady(source domain.Source) bool {
 }
 
 func (s *Server) handleDeleteSource(w http.ResponseWriter, r *http.Request) {
+	ownerID, _, ok := s.resolveOwner(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "用户不存在或已禁用")
+		return
+	}
 	id := r.PathValue("id")
 	err := s.store.Update(func(cfg *domain.Config) error {
 		next := cfg.Sources[:0]
 		found := false
 		for _, source := range cfg.Sources {
-			if source.ID == id {
+			if source.ID == id && source.OwnerUserID == ownerID {
 				found = true
 				continue
 			}
@@ -352,7 +631,9 @@ func (s *Server) handleDeleteSource(w http.ResponseWriter, r *http.Request) {
 		}
 		cfg.Sources = next
 		for i := range cfg.Outputs {
-			cfg.Outputs[i].SourceIDs = removeString(cfg.Outputs[i].SourceIDs, id)
+			if cfg.Outputs[i].OwnerUserID == ownerID {
+				cfg.Outputs[i].SourceIDs = removeString(cfg.Outputs[i].SourceIDs, id)
+			}
 		}
 		return nil
 	})
@@ -364,8 +645,13 @@ func (s *Server) handleDeleteSource(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRefreshSource(w http.ResponseWriter, r *http.Request) {
+	ownerID, _, ok := s.resolveOwner(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "用户不存在或已禁用")
+		return
+	}
 	id := r.PathValue("id")
-	source, err := s.startRefreshSource(id)
+	source, err := s.startRefreshSource(ownerID, id)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "订阅源不存在")
 		return
@@ -374,13 +660,18 @@ func (s *Server) handleRefreshSource(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRefreshAll(w http.ResponseWriter, r *http.Request) {
+	ownerID, _, ok := s.resolveOwner(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "用户不存在或已禁用")
+		return
+	}
 	cfg := s.store.Snapshot()
 	views := []domain.SourceView{}
 	for _, source := range cfg.Sources {
-		if !source.Enabled {
+		if source.OwnerUserID != ownerID || !source.Enabled {
 			continue
 		}
-		refreshed, err := s.startRefreshSource(source.ID)
+		refreshed, err := s.startRefreshSource(ownerID, source.ID)
 		if err != nil {
 			continue
 		}
@@ -390,11 +681,27 @@ func (s *Server) handleRefreshAll(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleOutputs(w http.ResponseWriter, r *http.Request) {
+	ownerID, _, ok := s.resolveOwner(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "用户不存在或已禁用")
+		return
+	}
 	cfg := s.store.Snapshot()
-	writeJSON(w, http.StatusOK, cfg.Outputs)
+	outputs := make([]domain.Output, 0, len(cfg.Outputs))
+	for _, output := range cfg.Outputs {
+		if output.OwnerUserID == ownerID {
+			outputs = append(outputs, output)
+		}
+	}
+	writeJSON(w, http.StatusOK, outputs)
 }
 
 func (s *Server) handleCreateOutput(w http.ResponseWriter, r *http.Request) {
+	ownerID, _, ok := s.resolveOwner(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "用户不存在或已禁用")
+		return
+	}
 	var req domain.Output
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "请求格式错误")
@@ -405,6 +712,7 @@ func (s *Server) handleCreateOutput(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.ID = uuid.NewString()
+	req.OwnerUserID = ownerID
 	req.Slug = normalizeSlug(req.Slug)
 	if req.Format == "" {
 		req.Format = "clash"
@@ -414,10 +722,11 @@ func (s *Server) handleCreateOutput(w http.ResponseWriter, r *http.Request) {
 	}
 	err := s.store.Update(func(cfg *domain.Config) error {
 		for _, output := range cfg.Outputs {
-			if output.Slug == req.Slug {
+			if output.OwnerUserID == ownerID && output.Slug == req.Slug {
 				return errors.New("slug exists")
 			}
 		}
+		req.SourceIDs = existingSourceIDsForOwner(*cfg, ownerID, req.SourceIDs)
 		cfg.Outputs = append(cfg.Outputs, req)
 		return nil
 	})
@@ -429,6 +738,11 @@ func (s *Server) handleCreateOutput(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUpdateOutput(w http.ResponseWriter, r *http.Request) {
+	ownerID, _, ok := s.resolveOwner(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "用户不存在或已禁用")
+		return
+	}
 	id := r.PathValue("id")
 	var req domain.Output
 	if err := decodeJSON(r, &req); err != nil {
@@ -438,17 +752,19 @@ func (s *Server) handleUpdateOutput(w http.ResponseWriter, r *http.Request) {
 	var updated domain.Output
 	err := s.store.Update(func(cfg *domain.Config) error {
 		for i := range cfg.Outputs {
-			if cfg.Outputs[i].ID == id {
+			if cfg.Outputs[i].ID == id && cfg.Outputs[i].OwnerUserID == ownerID {
 				req.ID = id
+				req.OwnerUserID = ownerID
 				req.Slug = normalizeSlug(req.Slug)
 				if req.Slug == "" {
 					return errors.New("empty slug")
 				}
 				for _, output := range cfg.Outputs {
-					if output.ID != id && output.Slug == req.Slug {
+					if output.OwnerUserID == ownerID && output.ID != id && output.Slug == req.Slug {
 						return errors.New("slug exists")
 					}
 				}
+				req.SourceIDs = existingSourceIDsForOwner(*cfg, ownerID, req.SourceIDs)
 				cfg.Outputs[i] = req
 				updated = req
 				return nil
@@ -464,12 +780,17 @@ func (s *Server) handleUpdateOutput(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteOutput(w http.ResponseWriter, r *http.Request) {
+	ownerID, _, ok := s.resolveOwner(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "用户不存在或已禁用")
+		return
+	}
 	id := r.PathValue("id")
 	err := s.store.Update(func(cfg *domain.Config) error {
 		next := cfg.Outputs[:0]
 		found := false
 		for _, output := range cfg.Outputs {
-			if output.ID == id {
+			if output.ID == id && output.OwnerUserID == ownerID {
 				found = true
 				continue
 			}
@@ -489,11 +810,16 @@ func (s *Server) handleDeleteOutput(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
+	ownerID, _, ok := s.resolveOwner(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "用户不存在或已禁用")
+		return
+	}
 	id := r.PathValue("id")
 	cfg := s.store.Snapshot()
 	for _, output := range cfg.Outputs {
-		if output.ID == id {
-			writeJSON(w, http.StatusOK, aggregator.Preview(cfg, output))
+		if output.ID == id && output.OwnerUserID == ownerID {
+			writeJSON(w, http.StatusOK, aggregator.Preview(configForOwner(cfg, ownerID), output))
 			return
 		}
 	}
@@ -501,7 +827,23 @@ func (s *Server) handlePreview(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePublicSubscription(w http.ResponseWriter, r *http.Request) {
-	slug := r.PathValue("slug")
+	s.servePublicSubscription(w, r, "admin", r.PathValue("slug"))
+}
+
+func (s *Server) handleUserPublicSubscription(w http.ResponseWriter, r *http.Request) {
+	userSlug := normalizeSlug(r.PathValue("userSlug"))
+	cfg := s.store.Snapshot()
+	for _, user := range cfg.Users {
+		if user.Slug == userSlug && user.Enabled {
+			s.servePublicSubscription(w, r, user.ID, r.PathValue("slug"))
+			return
+		}
+	}
+	writeError(w, http.StatusNotFound, "用户不存在")
+}
+
+func (s *Server) servePublicSubscription(w http.ResponseWriter, r *http.Request, ownerID string, slug string) {
+	slug = normalizeSlug(slug)
 	cfg := s.store.Snapshot()
 	if cfg.Settings.UserTokenHash != "" {
 		token := subscriptionTokenFromRequest(r)
@@ -511,7 +853,7 @@ func (s *Server) handlePublicSubscription(w http.ResponseWriter, r *http.Request
 		}
 	}
 	for _, output := range cfg.Outputs {
-		if output.Slug != slug {
+		if output.OwnerUserID != ownerID || output.Slug != slug {
 			continue
 		}
 		if !output.Enabled {
@@ -521,7 +863,7 @@ func (s *Server) handlePublicSubscription(w http.ResponseWriter, r *http.Request
 		if format := normalizeOutputFormat(r.URL.Query().Get("format")); format != "" {
 			output.Format = format
 		}
-		result := aggregator.Build(cfg, output)
+		result := aggregator.Build(configForOwner(cfg, ownerID), output)
 		data, contentType, err := aggregator.Render(output, result)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "订阅生成失败")
@@ -530,7 +872,7 @@ func (s *Server) handlePublicSubscription(w http.ResponseWriter, r *http.Request
 		now := time.Now()
 		_ = s.store.Update(func(cfg *domain.Config) error {
 			for i := range cfg.Outputs {
-				if cfg.Outputs[i].ID == output.ID {
+				if cfg.Outputs[i].ID == output.ID && cfg.Outputs[i].OwnerUserID == ownerID {
 					cfg.Outputs[i].LastGeneratedAt = &now
 					cfg.Outputs[i].LastNodeCount = len(result.Nodes)
 					cfg.Outputs[i].LastDroppedCount = result.DuplicateCount + result.FilteredCount + result.UnavailableCount
@@ -572,31 +914,69 @@ func subscriptionFilename(slug string, format string) string {
 }
 
 func (s *Server) handleBackup(w http.ResponseWriter, r *http.Request) {
+	p := currentPrincipal(r)
 	cfg := s.store.Snapshot()
+	if p.User.Role != "admin" {
+		cfg = configForOwner(cfg, p.User.ID)
+		cfg.Users = []domain.User{p.User}
+		cfg.InviteCodes = []domain.InviteCode{}
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Content-Disposition", "attachment; filename=\"sub-nest-backup.json\"")
 	_ = json.NewEncoder(w).Encode(cfg)
 }
 
 func (s *Server) handleRestore(w http.ResponseWriter, r *http.Request) {
-	var cfg domain.Config
-	if err := decodeJSON(r, &cfg); err != nil {
+	p := currentPrincipal(r)
+	var incoming domain.Config
+	if err := decodeJSON(r, &incoming); err != nil {
 		writeError(w, http.StatusBadRequest, "备份文件格式错误")
 		return
 	}
-	if err := s.store.Replace(cfg); err != nil {
+	var err error
+	if p.User.Role == "admin" {
+		err = s.store.Replace(incoming)
+	} else {
+		err = s.store.Update(func(cfg *domain.Config) error {
+			nextSources := cfg.Sources[:0]
+			for _, source := range cfg.Sources {
+				if source.OwnerUserID != p.User.ID {
+					nextSources = append(nextSources, source)
+				}
+			}
+			for _, source := range incoming.Sources {
+				source.OwnerUserID = p.User.ID
+				nextSources = append(nextSources, source)
+			}
+			nextOutputs := cfg.Outputs[:0]
+			for _, output := range cfg.Outputs {
+				if output.OwnerUserID != p.User.ID {
+					nextOutputs = append(nextOutputs, output)
+				}
+			}
+			for _, output := range incoming.Outputs {
+				output.OwnerUserID = p.User.ID
+				output.SourceIDs = existingSourceIDsForOwner(domain.Config{Sources: nextSources}, p.User.ID, output.SourceIDs)
+				nextOutputs = append(nextOutputs, output)
+			}
+			cfg.Sources = nextSources
+			cfg.Outputs = nextOutputs
+			return nil
+		})
+	}
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, "恢复失败")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-func (s *Server) refreshSource(id string) (domain.Source, error) {
+func (s *Server) refreshSource(ownerID string, id string) (domain.Source, error) {
 	cfg := s.store.Snapshot()
 	var source domain.Source
 	found := false
 	for _, item := range cfg.Sources {
-		if item.ID == id {
+		if item.ID == id && item.OwnerUserID == ownerID {
 			source = item
 			found = true
 			break
@@ -608,7 +988,7 @@ func (s *Server) refreshSource(id string) (domain.Source, error) {
 	refreshed, refreshErr := s.fetcher.RefreshWithProgress(source, func(status string, message string, percent int, nodes []domain.Node) {
 		_ = s.store.Update(func(cfg *domain.Config) error {
 			for i := range cfg.Sources {
-				if cfg.Sources[i].ID == id {
+				if cfg.Sources[i].ID == id && cfg.Sources[i].OwnerUserID == ownerID {
 					cfg.Sources[i].LastStatus = status
 					cfg.Sources[i].RefreshProgress = message
 					cfg.Sources[i].RefreshPercent = percent
@@ -629,10 +1009,11 @@ func (s *Server) refreshSource(id string) (domain.Source, error) {
 	}
 	err := s.store.Update(func(cfg *domain.Config) error {
 		for i := range cfg.Sources {
-			if cfg.Sources[i].ID == id {
+			if cfg.Sources[i].ID == id && cfg.Sources[i].OwnerUserID == ownerID {
 				if refreshed.CachedNodes == nil && len(cfg.Sources[i].CachedNodes) > 0 {
 					refreshed.CachedNodes = cfg.Sources[i].CachedNodes
 				}
+				refreshed.OwnerUserID = ownerID
 				cfg.Sources[i] = refreshed
 				return nil
 			}
@@ -642,10 +1023,10 @@ func (s *Server) refreshSource(id string) (domain.Source, error) {
 	return refreshed, err
 }
 
-func (s *Server) startRefreshSource(id string) (domain.Source, error) {
+func (s *Server) startRefreshSource(ownerID string, id string) (domain.Source, error) {
 	cfg := s.store.Snapshot()
 	for _, source := range cfg.Sources {
-		if source.ID == id {
+		if source.ID == id && source.OwnerUserID == ownerID {
 			if source.LastStatus == "refreshing" {
 				return source, nil
 			}
@@ -656,7 +1037,7 @@ func (s *Server) startRefreshSource(id string) (domain.Source, error) {
 			source.LastRefreshedAt = &now
 			err := s.store.Update(func(cfg *domain.Config) error {
 				for i := range cfg.Sources {
-					if cfg.Sources[i].ID == id {
+					if cfg.Sources[i].ID == id && cfg.Sources[i].OwnerUserID == ownerID {
 						cfg.Sources[i].LastStatus = source.LastStatus
 						cfg.Sources[i].RefreshProgress = source.RefreshProgress
 						cfg.Sources[i].RefreshPercent = source.RefreshPercent
@@ -670,7 +1051,7 @@ func (s *Server) startRefreshSource(id string) (domain.Source, error) {
 				return domain.Source{}, err
 			}
 			go func() {
-				if _, err := s.refreshSource(id); err != nil {
+				if _, err := s.refreshSource(ownerID, id); err != nil {
 					s.logger.Warn("refresh source task failed", "source_id", id, "error", err)
 				}
 			}()
@@ -682,19 +1063,27 @@ func (s *Server) startRefreshSource(id string) (domain.Source, error) {
 
 func (s *Server) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cfg := s.store.Snapshot()
-		if cfg.Settings.AdminTokenHash == "" {
-			writeError(w, http.StatusPreconditionRequired, "需要先初始化管理员 token")
-			return
-		}
-		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		raw, ok := strings.CutPrefix(token, "local:")
-		if !ok || bcrypt.CompareHashAndPassword([]byte(cfg.Settings.AdminTokenHash), []byte(raw)) != nil {
+		p, err := s.authenticate(r)
+		if err != nil {
+			if errors.Is(err, errNeedsSetup) {
+				writeError(w, http.StatusPreconditionRequired, "需要先初始化管理员 token")
+				return
+			}
 			writeError(w, http.StatusUnauthorized, "请先登录")
 			return
 		}
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), principalContextKey, p)))
 	})
+}
+
+func (s *Server) authAdmin(next http.Handler) http.Handler {
+	return s.auth(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if currentPrincipal(r).User.Role != "admin" {
+			writeError(w, http.StatusForbidden, "需要管理员权限")
+			return
+		}
+		next.ServeHTTP(w, r)
+	}))
 }
 
 func (s *Server) needsSetup() bool {
@@ -719,8 +1108,172 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, filepath.Join(s.staticPath, "index.html"))
 }
 
-func issueSessionToken(raw string) string {
-	return "local:" + raw
+var errNeedsSetup = errors.New("needs setup")
+
+func (s *Server) authenticate(r *http.Request) (principal, error) {
+	cfg := s.store.Snapshot()
+	if cfg.Settings.AdminTokenHash == "" {
+		return principal{}, errNeedsSetup
+	}
+	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	raw, ok := strings.CutPrefix(token, "local:")
+	if !ok {
+		return principal{}, errors.New("invalid token")
+	}
+	userID, secret := parseSessionToken(raw)
+	if userID == "" && bcrypt.CompareHashAndPassword([]byte(cfg.Settings.AdminTokenHash), []byte(secret)) == nil {
+		return principal{User: findUser(cfg, "admin")}, nil
+	}
+	if userID == "admin" && bcrypt.CompareHashAndPassword([]byte(cfg.Settings.AdminTokenHash), []byte(secret)) == nil {
+		return principal{User: findUser(cfg, "admin")}, nil
+	}
+	for _, user := range cfg.Users {
+		if user.ID != userID || !user.Enabled || user.TokenHash == "" {
+			continue
+		}
+		if bcrypt.CompareHashAndPassword([]byte(user.TokenHash), []byte(secret)) == nil {
+			return principal{User: user}, nil
+		}
+	}
+	return principal{}, errors.New("invalid token")
+}
+
+func issueSessionToken(userID string, raw string) string {
+	payload := userID + ":" + raw
+	return "local:v2:" + base64.RawURLEncoding.EncodeToString([]byte(payload))
+}
+
+func parseSessionToken(raw string) (string, string) {
+	encoded, ok := strings.CutPrefix(raw, "v2:")
+	if !ok {
+		return "", raw
+	}
+	data, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", ""
+	}
+	userID, secret, ok := strings.Cut(string(data), ":")
+	if !ok {
+		return "", ""
+	}
+	return userID, secret
+}
+
+func currentPrincipal(r *http.Request) principal {
+	if p, ok := r.Context().Value(principalContextKey).(principal); ok {
+		return p
+	}
+	return principal{}
+}
+
+func (s *Server) resolveOwner(r *http.Request) (string, string, bool) {
+	p := currentPrincipal(r)
+	if p.User.ID == "" {
+		return "", "", false
+	}
+	if p.User.Role != "admin" {
+		return p.User.ID, p.User.Slug, p.User.Enabled
+	}
+	targetID := strings.TrimSpace(r.URL.Query().Get("userId"))
+	if targetID == "" {
+		targetID = p.User.ID
+	}
+	cfg := s.store.Snapshot()
+	for _, user := range cfg.Users {
+		if user.ID == targetID {
+			return user.ID, user.Slug, true
+		}
+	}
+	return "", "", false
+}
+
+func configForOwner(cfg domain.Config, ownerID string) domain.Config {
+	out := cfg
+	out.Sources = []domain.Source{}
+	for _, source := range cfg.Sources {
+		if source.OwnerUserID == ownerID {
+			out.Sources = append(out.Sources, source)
+		}
+	}
+	out.Outputs = []domain.Output{}
+	for _, output := range cfg.Outputs {
+		if output.OwnerUserID == ownerID {
+			out.Outputs = append(out.Outputs, output)
+		}
+	}
+	return out
+}
+
+func existingSourceIDsForOwner(cfg domain.Config, ownerID string, ids []string) []string {
+	allowed := map[string]bool{}
+	for _, source := range cfg.Sources {
+		if source.OwnerUserID == ownerID {
+			allowed[source.ID] = true
+		}
+	}
+	out := []string{}
+	for _, id := range ids {
+		if allowed[id] {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+func authResponse(token string, user domain.User) map[string]interface{} {
+	return map[string]interface{}{"token": token, "user": publicUser(user)}
+}
+
+func publicUser(user domain.User) map[string]interface{} {
+	return map[string]interface{}{
+		"id":          user.ID,
+		"slug":        user.Slug,
+		"name":        user.Name,
+		"role":        user.Role,
+		"enabled":     user.Enabled,
+		"createdAt":   user.CreatedAt,
+		"lastLoginAt": user.LastLoginAt,
+	}
+}
+
+func adminUser() domain.User {
+	return domain.User{
+		ID:      "admin",
+		Slug:    "admin",
+		Name:    "Admin",
+		Role:    "admin",
+		Enabled: true,
+	}
+}
+
+func ensureAdminUser(cfg *domain.Config) {
+	for i := range cfg.Users {
+		if cfg.Users[i].ID == "admin" {
+			cfg.Users[i].Slug = "admin"
+			cfg.Users[i].Name = "Admin"
+			cfg.Users[i].Role = "admin"
+			cfg.Users[i].Enabled = true
+			if cfg.Users[i].CreatedAt.IsZero() {
+				cfg.Users[i].CreatedAt = time.Now()
+			}
+			return
+		}
+	}
+	user := adminUser()
+	user.CreatedAt = time.Now()
+	cfg.Users = append([]domain.User{user}, cfg.Users...)
+}
+
+func findUser(cfg domain.Config, id string) domain.User {
+	for _, user := range cfg.Users {
+		if user.ID == id {
+			return user
+		}
+	}
+	if id == "admin" {
+		return adminUser()
+	}
+	return domain.User{}
 }
 
 func hashToken(raw string) ([]byte, error) {

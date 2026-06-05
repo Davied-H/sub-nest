@@ -8,6 +8,7 @@ import {
   DownloadIcon,
   EyeIcon,
   FileJsonIcon,
+  KeyRoundIcon,
   Loader2Icon,
   LockIcon,
   PauseCircleIcon,
@@ -15,6 +16,7 @@ import {
   RefreshCcwIcon,
   SaveIcon,
   ServerIcon,
+  UserIcon,
   ShieldIcon,
   Trash2Icon,
   WifiOffIcon,
@@ -204,6 +206,28 @@ type Settings = {
   hasUserToken: boolean
 }
 
+type User = {
+  id: string
+  slug: string
+  name: string
+  role: "admin" | "user"
+  enabled: boolean
+  createdAt?: string
+  lastLoginAt?: string
+}
+
+type InviteCode = {
+  id: string
+  label: string
+  createdAt: string
+  usedAt?: string
+  usedByUserId?: string
+}
+
+type CreatedInviteCode = InviteCode & {
+  code: string
+}
+
 const defaultSource: Source = {
   id: "",
   name: "",
@@ -258,6 +282,9 @@ const outputFormatItems = [
 function App() {
   const [health, setHealth] = useState<Health | null>(null)
   const [token, setToken] = useState(() => localStorage.getItem("sub-nest-token") ?? localStorage.getItem("subagg-token") ?? "")
+  const [user, setUser] = useState<User | null>(() => readStoredUser())
+  const [users, setUsers] = useState<User[]>([])
+  const [targetUserId, setTargetUserId] = useState(() => localStorage.getItem("sub-nest-target-user") ?? "")
   const [dashboard, setDashboard] = useState<Dashboard | null>(null)
   const [sources, setSources] = useState<Source[]>([])
   const [outputs, setOutputs] = useState<Output[]>([])
@@ -270,8 +297,11 @@ function App() {
 
   const api = useMemo(() => createAPI(token), [token])
   const authenticated = Boolean(token)
+  const targetUserKnown = users.some((item) => item.id === targetUserId)
+  const activeUserId = user?.role === "admin" ? (targetUserKnown ? targetUserId : user.id) : user?.id
+  const activeUser = users.find((item) => item.id === activeUserId) ?? user
+  const scopeQuery = user?.role === "admin" && activeUserId && activeUserId !== user.id ? `?userId=${encodeURIComponent(activeUserId)}` : ""
   const anyRefreshing = sources.some((source) => source.lastStatus === "refreshing")
-  const publicBase = window.location.origin
 
   const loadProtected = useCallback(async (options?: { silent?: boolean }) => {
     if (!token) {
@@ -281,12 +311,28 @@ function App() {
       setLoading(true)
     }
     try {
-      const [nextDashboard, nextSources, nextOutputs, nextSettings] = await Promise.all([
-        api.get<Dashboard>("/api/dashboard"),
-        api.get<Source[]>("/api/sources?includeUrl=1"),
-        api.get<Output[]>("/api/outputs"),
+      const [nextUserResponse, nextUsers, nextDashboard, nextSources, nextOutputs, nextSettings] = await Promise.all([
+        api.get<{ user: User }>("/api/me"),
+        user?.role === "admin" ? api.get<User[]>("/api/admin/users") : Promise.resolve([]),
+        api.get<Dashboard>(withScope("/api/dashboard", scopeQuery)),
+        api.get<Source[]>(withScope("/api/sources?includeUrl=1", scopeQuery)),
+        api.get<Output[]>(withScope("/api/outputs", scopeQuery)),
         api.get<Settings>("/api/settings"),
       ])
+      setUser(nextUserResponse.user)
+      localStorage.setItem("sub-nest-user", JSON.stringify(nextUserResponse.user))
+      if (nextUserResponse.user.role === "admin") {
+        const adminUsers = nextUsers.length > 0 ? nextUsers : [nextUserResponse.user]
+        setUsers(adminUsers)
+        if (!targetUserId || !adminUsers.some((item) => item.id === targetUserId)) {
+          setTargetUserId(nextUserResponse.user.id)
+          localStorage.setItem("sub-nest-target-user", nextUserResponse.user.id)
+        }
+      } else {
+        setUsers([])
+        setTargetUserId("")
+        localStorage.removeItem("sub-nest-target-user")
+      }
       setDashboard(nextDashboard)
       setSources(nextSources)
       setOutputs(nextOutputs)
@@ -297,7 +343,7 @@ function App() {
       }
       if (nextOutputs[0]) {
         try {
-          setPreview(await api.get<Preview>(`/api/outputs/${nextOutputs[0].id}/preview`))
+          setPreview(await api.get<Preview>(withScope(`/api/outputs/${nextOutputs[0].id}/preview`, scopeQuery)))
         } catch {
           setPreview(null)
         }
@@ -305,14 +351,17 @@ function App() {
     } catch (error) {
       localStorage.removeItem("subagg-token")
       localStorage.removeItem("sub-nest-token")
+      localStorage.removeItem("sub-nest-user")
+      localStorage.removeItem("sub-nest-target-user")
       setToken("")
+      setUser(null)
       toast.error(messageOf(error))
     } finally {
       if (!options?.silent) {
         setLoading(false)
       }
     }
-  }, [api, token, userToken])
+  }, [api, scopeQuery, targetUserId, token, user?.id, user?.role, userToken])
 
   useEffect(() => {
     createAPI("").get<Health>("/api/health").then(setHealth).catch(() => {
@@ -327,15 +376,39 @@ function App() {
   async function handleAuth(rawToken: string, setup: boolean, publicBaseURL: string) {
     setBusy("auth")
     try {
-      const response = await createAPI("").post<{ token: string }>(
+      const response = await createAPI("").post<{ token: string; user: User }>(
         setup ? "/api/setup" : "/api/login",
         setup ? { token: rawToken, publicBaseUrl: publicBaseURL } : { token: rawToken },
       )
       localStorage.setItem("sub-nest-token", response.token)
+      localStorage.setItem("sub-nest-user", JSON.stringify(response.user))
+      localStorage.setItem("sub-nest-target-user", response.user.id)
       localStorage.removeItem("subagg-token")
       setToken(response.token)
+      setUser(response.user)
+      setTargetUserId(response.user.id)
       setHealth({ ok: true, needsAdminSetup: false })
       toast.success(setup ? "管理员 token 已设置" : "登录成功")
+    } catch (error) {
+      toast.error(messageOf(error))
+    } finally {
+      setBusy("")
+    }
+  }
+
+  async function handleRegister(payload: { inviteCode: string; userSlug: string; name: string; token: string }) {
+    setBusy("auth")
+    try {
+      const response = await createAPI("").post<{ token: string; user: User }>("/api/register", payload)
+      localStorage.setItem("sub-nest-token", response.token)
+      localStorage.setItem("sub-nest-user", JSON.stringify(response.user))
+      localStorage.removeItem("subagg-token")
+      localStorage.removeItem("sub-nest-target-user")
+      setToken(response.token)
+      setUser(response.user)
+      setTargetUserId("")
+      setHealth({ ok: true, needsAdminSetup: false })
+      toast.success("注册成功")
     } catch (error) {
       toast.error(messageOf(error))
     } finally {
@@ -346,7 +419,7 @@ function App() {
   async function refreshAll() {
     setBusy("refresh-all")
     try {
-      await api.post("/api/refresh", {})
+      await api.post(withScope("/api/refresh", scopeQuery), {})
       toast.success("刷新任务已开始")
       await loadProtected()
     } catch (error) {
@@ -367,6 +440,7 @@ function App() {
           setup={health.needsAdminSetup}
           busy={busy === "auth"}
           onSubmit={handleAuth}
+          onRegister={handleRegister}
         />
         <Toaster />
       </TooltipProvider>
@@ -396,6 +470,13 @@ function App() {
               <Badge variant="outline">
                 {dashboard?.totalCachedNodes ?? 0} 个缓存节点
               </Badge>
+              {user ? (
+                <Badge variant={user.role === "admin" ? "default" : "secondary"}>
+                  <UserIcon />
+                  {activeUser?.name || user.name}
+                  {user.role === "admin" && activeUser?.id !== user.id ? " 的空间" : ""}
+                </Badge>
+              ) : null}
               <Button variant="outline" onClick={refreshAll} disabled={busy === "refresh-all" || anyRefreshing}>
                 {busy === "refresh-all" || anyRefreshing ? <Loader2Icon data-icon="inline-start" /> : <RefreshCcwIcon data-icon="inline-start" />}
                 {anyRefreshing ? "刷新中" : "刷新全部"}
@@ -405,7 +486,12 @@ function App() {
                 onClick={() => {
                   localStorage.removeItem("subagg-token")
                   localStorage.removeItem("sub-nest-token")
+                  localStorage.removeItem("sub-nest-user")
+                  localStorage.removeItem("sub-nest-target-user")
                   setToken("")
+                  setUser(null)
+                  setUsers([])
+                  setTargetUserId("")
                   toast.success("已退出")
                 }}
               >
@@ -421,13 +507,45 @@ function App() {
                 <TabsTrigger value="sources">订阅源</TabsTrigger>
                 <TabsTrigger value="outputs">公开订阅</TabsTrigger>
                 <TabsTrigger value="preview">预览</TabsTrigger>
+                {user?.role === "admin" ? <TabsTrigger value="users">用户</TabsTrigger> : null}
                 <TabsTrigger value="backup">备份</TabsTrigger>
-                <TabsTrigger value="settings">设置</TabsTrigger>
+                {user?.role === "admin" ? <TabsTrigger value="settings">设置</TabsTrigger> : null}
               </TabsList>
+              {user?.role === "admin" ? (
+                <Select
+                  items={users.map((item) => ({ label: `${item.name || item.slug}${item.enabled ? "" : "（已禁用）"}`, value: item.id }))}
+                  value={activeUserId}
+                  onValueChange={(value) => {
+                    const next = String(value)
+                    setTargetUserId(next)
+                    localStorage.setItem("sub-nest-target-user", next)
+                    setPreview(null)
+                  }}
+                >
+                  <SelectTrigger className="w-full lg:w-56">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectGroup>
+                      {users.map((item) => (
+                        <SelectItem key={item.id} value={item.id}>
+                          {item.name || item.slug}{item.enabled ? "" : "（已禁用）"}
+                        </SelectItem>
+                      ))}
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
+              ) : null}
             </div>
 
             <TabsContent value="overview">
-              <Overview dashboard={dashboard} loading={loading} outputs={outputs} publicBase={publicBase} userToken={userToken} />
+              <Overview
+                dashboard={dashboard}
+                loading={loading}
+                outputs={outputs}
+                publicBase={publicBaseFromExample(dashboard?.publicExampleUrl)}
+                userToken={userToken}
+              />
             </TabsContent>
             <TabsContent value="sources">
               <SourcesView
@@ -436,6 +554,7 @@ function App() {
                 loading={loading}
                 busy={busy}
                 setBusy={setBusy}
+                scopeQuery={scopeQuery}
                 reload={loadProtected}
               />
             </TabsContent>
@@ -445,8 +564,9 @@ function App() {
                 outputs={outputs}
                 sources={sources}
                 loading={loading}
+                scopeQuery={scopeQuery}
                 reload={loadProtected}
-                publicBase={publicBase}
+                publicBase={publicBaseFromExample(dashboard?.publicExampleUrl)}
                 userToken={userToken}
               />
             </TabsContent>
@@ -456,33 +576,41 @@ function App() {
                 outputs={outputs}
                 preview={preview}
                 setPreview={setPreview}
+                scopeQuery={scopeQuery}
               />
             </TabsContent>
+            {user?.role === "admin" ? (
+              <TabsContent value="users">
+                <UsersView api={api} users={users} reload={loadProtected} />
+              </TabsContent>
+            ) : null}
             <TabsContent value="backup">
               <BackupView api={api} reload={loadProtected} />
             </TabsContent>
-            <TabsContent value="settings">
-              <SettingsView
-                api={api}
-                settings={settings}
-                userToken={userToken}
-                onAdminTokenUpdated={(nextToken) => {
-                  localStorage.setItem("sub-nest-token", nextToken)
-                  localStorage.removeItem("subagg-token")
-                  setToken(nextToken)
-                }}
-                onUserTokenUpdated={(nextSettings, nextUserToken) => {
-                  setSettings(nextSettings)
-                  if (nextUserToken) {
-                    localStorage.setItem("sub-nest-user-token", nextUserToken)
-                    setUserToken(nextUserToken)
-                  } else {
-                    localStorage.removeItem("sub-nest-user-token")
-                    setUserToken("")
-                  }
-                }}
-              />
-            </TabsContent>
+            {user?.role === "admin" ? (
+              <TabsContent value="settings">
+                <SettingsView
+                  api={api}
+                  settings={settings}
+                  userToken={userToken}
+                  onAdminTokenUpdated={(nextToken) => {
+                    localStorage.setItem("sub-nest-token", nextToken)
+                    localStorage.removeItem("subagg-token")
+                    setToken(nextToken)
+                  }}
+                  onUserTokenUpdated={(nextSettings, nextUserToken) => {
+                    setSettings(nextSettings)
+                    if (nextUserToken) {
+                      localStorage.setItem("sub-nest-user-token", nextUserToken)
+                      setUserToken(nextUserToken)
+                    } else {
+                      localStorage.removeItem("sub-nest-user-token")
+                      setUserToken("")
+                    }
+                  }}
+                />
+              </TabsContent>
+            ) : null}
           </Tabs>
         </div>
       </main>
@@ -495,29 +623,60 @@ function AuthScreen({
   setup,
   busy,
   onSubmit,
+  onRegister,
 }: {
   setup: boolean
   busy: boolean
   onSubmit: (token: string, setup: boolean, publicBaseURL: string) => void
+  onRegister: (payload: { inviteCode: string; userSlug: string; name: string; token: string }) => void
 }) {
   const [rawToken, setRawToken] = useState("")
+  const [mode, setMode] = useState<"login" | "register">("login")
+  const [inviteCode, setInviteCode] = useState("")
+  const [userSlug, setUserSlug] = useState("")
+  const [name, setName] = useState("")
+  const [publicBaseURL, setPublicBaseURL] = useState(window.location.origin)
+  const registering = !setup && mode === "register"
 
   return (
     <main className="flex min-h-screen items-center justify-center bg-background p-4">
       <Card className="w-full max-w-md">
         <CardHeader>
           <div className="flex size-10 items-center justify-center rounded-lg border bg-muted">
-            <LockIcon />
+            {registering ? <KeyRoundIcon /> : <LockIcon />}
           </div>
-          <CardTitle>{setup ? "初始化后台访问" : "登录后台"}</CardTitle>
+          <CardTitle>{setup ? "初始化后台访问" : registering ? "使用授权码注册" : "登录后台"}</CardTitle>
           <CardDescription>
-            后台使用本地 token 保护；订阅链接会在列表和日志中隐藏敏感部分。
+            {registering ? "注册后可使用自己的 token 独立维护订阅源和公开订阅。" : "后台使用本地 token 保护；订阅链接会在列表和日志中隐藏敏感部分。"}
           </CardDescription>
         </CardHeader>
         <CardContent>
           <FieldGroup>
+            {!setup ? (
+              <div className="grid grid-cols-2 gap-2">
+                <Button variant={!registering ? "default" : "outline"} onClick={() => setMode("login")}>登录</Button>
+                <Button variant={registering ? "default" : "outline"} onClick={() => setMode("register")}>注册</Button>
+              </div>
+            ) : null}
+            {registering ? (
+              <>
+                <Field>
+                  <FieldLabel htmlFor="invite-code">授权码</FieldLabel>
+                  <Input id="invite-code" value={inviteCode} onChange={(event) => setInviteCode(event.target.value)} />
+                </Field>
+                <Field>
+                  <FieldLabel htmlFor="user-slug">用户标识</FieldLabel>
+                  <Input id="user-slug" value={userSlug} onChange={(event) => setUserSlug(event.target.value)} placeholder="例如 alice" />
+                  <FieldDescription>仅使用小写字母、数字和短横线，用于生成 `/u/{userSlug || "alice"}/s/main`。</FieldDescription>
+                </Field>
+                <Field>
+                  <FieldLabel htmlFor="display-name">显示名称</FieldLabel>
+                  <Input id="display-name" value={name} onChange={(event) => setName(event.target.value)} placeholder="可选" />
+                </Field>
+              </>
+            ) : null}
             <Field>
-              <FieldLabel htmlFor="admin-token">管理 token</FieldLabel>
+              <FieldLabel htmlFor="admin-token">{registering ? "个人 token" : "管理 token"}</FieldLabel>
               <Input
                 id="admin-token"
                 type="password"
@@ -526,16 +685,33 @@ function AuthScreen({
                 placeholder="至少 8 位"
               />
             </Field>
+            {setup ? (
+              <Field>
+                <FieldLabel htmlFor="public-base">公开访问域名</FieldLabel>
+                <Input
+                  id="public-base"
+                  value={publicBaseURL}
+                  onChange={(event) => setPublicBaseURL(event.target.value)}
+                />
+                <FieldDescription>用于生成复制链接，可稍后在配置文件中调整。</FieldDescription>
+              </Field>
+            ) : null}
           </FieldGroup>
         </CardContent>
         <CardFooter>
           <Button
             className="w-full"
-            disabled={busy || rawToken.length < 8}
-            onClick={() => onSubmit(rawToken, setup, window.location.origin)}
+            disabled={busy || rawToken.length < 8 || (registering && (!inviteCode.trim() || !userSlug.trim()))}
+            onClick={() => {
+              if (registering) {
+                onRegister({ inviteCode, userSlug, name, token: rawToken })
+                return
+              }
+              onSubmit(rawToken, setup, publicBaseURL)
+            }}
           >
             {busy ? <Loader2Icon data-icon="inline-start" /> : <ShieldIcon data-icon="inline-start" />}
-            {setup ? "完成初始化" : "进入后台"}
+            {setup ? "完成初始化" : registering ? "创建账号" : "进入后台"}
           </Button>
         </CardFooter>
       </Card>
@@ -620,6 +796,7 @@ function SourcesView({
   loading,
   busy,
   setBusy,
+  scopeQuery,
   reload,
 }: {
   api: API
@@ -627,6 +804,7 @@ function SourcesView({
   loading: boolean
   busy: string
   setBusy: (value: string) => void
+  scopeQuery: string
   reload: (options?: { silent?: boolean }) => Promise<void>
 }) {
   const [editing, setEditing] = useState<Source | null>(null)
@@ -646,7 +824,7 @@ function SourcesView({
   async function refreshSource(source: Source) {
     setBusy(`refresh:${source.id}`)
     try {
-      await api.post(`/api/sources/${source.id}/refresh`, {})
+      await api.post(withScope(`/api/sources/${source.id}/refresh`, scopeQuery), {})
       toast.success(`${source.name} 已开始刷新`)
       await reload({ silent: true })
     } catch (error) {
@@ -672,7 +850,7 @@ function SourcesView({
       return
     }
     try {
-      await api.delete(`/api/sources/${source.id}`)
+      await api.delete(withScope(`/api/sources/${source.id}`, scopeQuery))
       toast.success("订阅源已删除")
       await reload()
     } catch (error) {
@@ -803,13 +981,13 @@ function SourcesView({
           try {
             let saved: Source
             if (source.id) {
-              saved = await api.put<Source>(`/api/sources/${source.id}`, source)
+              saved = await api.put<Source>(withScope(`/api/sources/${source.id}`, scopeQuery), source)
             } else {
-              saved = await api.post<Source>("/api/sources", source)
+              saved = await api.post<Source>(withScope("/api/sources", scopeQuery), source)
             }
             toast.success("订阅源已保存")
             if ((saved.sourceType ?? "url") === "file") {
-              await api.post(`/api/sources/${saved.id}/refresh`, {})
+              await api.post(withScope(`/api/sources/${saved.id}/refresh`, scopeQuery), {})
               toast.success("文件订阅已开始解析")
             }
             setEditing(null)
@@ -1003,6 +1181,7 @@ function OutputsView({
   outputs,
   sources,
   loading,
+  scopeQuery,
   reload,
   publicBase,
   userToken,
@@ -1011,6 +1190,7 @@ function OutputsView({
   outputs: Output[]
   sources: Source[]
   loading: boolean
+  scopeQuery: string
   reload: () => Promise<void>
   publicBase: string
   userToken: string
@@ -1028,7 +1208,7 @@ function OutputsView({
       return
     }
     try {
-      await api.delete(`/api/outputs/${output.id}`)
+      await api.delete(withScope(`/api/outputs/${output.id}`, scopeQuery))
       toast.success("公开订阅已删除")
       await reload()
     } catch (error) {
@@ -1123,9 +1303,9 @@ function OutputsView({
         onSave={async (output) => {
           try {
             if (output.id) {
-              await api.put(`/api/outputs/${output.id}`, output)
+              await api.put(withScope(`/api/outputs/${output.id}`, scopeQuery), output)
             } else {
-              await api.post("/api/outputs", output)
+              await api.post(withScope("/api/outputs", scopeQuery), output)
             }
             toast.success("公开订阅已保存")
             setEditing(null)
@@ -1267,11 +1447,13 @@ function PreviewView({
   outputs,
   preview,
   setPreview,
+  scopeQuery,
 }: {
   api: API
   outputs: Output[]
   preview: Preview | null
   setPreview: (preview: Preview | null) => void
+  scopeQuery: string
 }) {
   const [selected, setSelected] = useState(outputs[0]?.id ?? "")
   const [loading, setLoading] = useState(false)
@@ -1296,7 +1478,7 @@ function PreviewView({
     }
     setLoading(true)
     try {
-      setPreview(await api.get<Preview>(`/api/outputs/${id}/preview`))
+      setPreview(await api.get<Preview>(withScope(`/api/outputs/${id}/preview`, scopeQuery)))
       toast.success("预览已生成")
     } catch (error) {
       toast.error(messageOf(error))
@@ -1314,7 +1496,7 @@ function PreviewView({
       Object.entries(nameDrafts).map(([key, value]) => [key, value.trim()]).filter(([, value]) => value),
     )
     try {
-      await api.put(`/api/outputs/${output.id}`, {
+      await api.put(withScope(`/api/outputs/${output.id}`, scopeQuery), {
         ...output,
         nodeNameOverrides: cleaned,
       })
@@ -1567,6 +1749,158 @@ function BackupView({ api, reload }: { api: API; reload: () => Promise<void> }) 
   )
 }
 
+function UsersView({ api, users, reload }: { api: API; users: User[]; reload: () => Promise<void> }) {
+  const [inviteCodes, setInviteCodes] = useState<InviteCode[]>([])
+  const [label, setLabel] = useState("")
+  const [createdCode, setCreatedCode] = useState("")
+  const [loading, setLoading] = useState(false)
+
+  const loadInvites = useCallback(async () => {
+    try {
+      setInviteCodes(await api.get<InviteCode[]>("/api/admin/invite-codes"))
+    } catch (error) {
+      toast.error(messageOf(error))
+    }
+  }, [api])
+
+  useEffect(() => {
+    void loadInvites()
+  }, [loadInvites])
+
+  async function createInvite() {
+    setLoading(true)
+    try {
+      const invite = await api.post<CreatedInviteCode>("/api/admin/invite-codes", { label })
+      setCreatedCode(invite.code)
+      setLabel("")
+      toast.success("授权码已创建")
+      await loadInvites()
+    } catch (error) {
+      toast.error(messageOf(error))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function setUserEnabled(user: User, enabled: boolean) {
+    try {
+      await api.put(`/api/admin/users/${user.id}`, { enabled })
+      toast.success(enabled ? "用户已启用" : "用户已禁用")
+      await reload()
+    } catch (error) {
+      toast.error(messageOf(error))
+    }
+  }
+
+  const userName = (id?: string) => users.find((item) => item.id === id)?.name || users.find((item) => item.id === id)?.slug || id || "-"
+
+  return (
+    <div className="grid gap-4 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+      <Card>
+        <CardHeader>
+          <CardTitle>授权码</CardTitle>
+          <CardDescription>授权码只显示一次，用户注册成功后自动失效。</CardDescription>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-4">
+          <FieldGroup>
+            <Field>
+              <FieldLabel htmlFor="invite-label">备注</FieldLabel>
+              <Input id="invite-label" value={label} onChange={(event) => setLabel(event.target.value)} placeholder="例如 Alice" />
+            </Field>
+            <Button onClick={createInvite} disabled={loading}>
+              {loading ? <Loader2Icon data-icon="inline-start" /> : <KeyRoundIcon data-icon="inline-start" />}
+              创建授权码
+            </Button>
+          </FieldGroup>
+          {createdCode ? (
+            <Alert>
+              <KeyRoundIcon />
+              <AlertTitle>请现在复制授权码</AlertTitle>
+              <AlertDescription className="flex flex-col gap-2">
+                <span className="break-all font-mono text-sm">{createdCode}</span>
+                <Button variant="outline" size="sm" className="w-fit" onClick={() => copyText(createdCode, "授权码已复制")}>
+                  <ClipboardIcon data-icon="inline-start" />
+                  复制授权码
+                </Button>
+              </AlertDescription>
+            </Alert>
+          ) : null}
+          <div className="overflow-x-auto">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>备注</TableHead>
+                  <TableHead>状态</TableHead>
+                  <TableHead>使用者</TableHead>
+                  <TableHead>创建时间</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {inviteCodes.length === 0 ? (
+                  <TableRow><TableCell colSpan={4} className="text-muted-foreground">暂无授权码</TableCell></TableRow>
+                ) : inviteCodes.map((invite) => (
+                  <TableRow key={invite.id}>
+                    <TableCell className="max-w-40 truncate">{invite.label || "-"}</TableCell>
+                    <TableCell><Badge variant={invite.usedAt ? "secondary" : "outline"}>{invite.usedAt ? "已使用" : "未使用"}</Badge></TableCell>
+                    <TableCell className="max-w-40 truncate">{userName(invite.usedByUserId)}</TableCell>
+                    <TableCell className="text-muted-foreground">{formatTime(invite.createdAt)}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle>用户</CardTitle>
+          <CardDescription>admin 可切换到任意用户空间进行管理。</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="overflow-x-auto">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>用户</TableHead>
+                  <TableHead>角色</TableHead>
+                  <TableHead>状态</TableHead>
+                  <TableHead>最近登录</TableHead>
+                  <TableHead className="text-right">操作</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {users.map((item) => (
+                  <TableRow key={item.id}>
+                    <TableCell className="min-w-48">
+                      <div className="flex flex-col">
+                        <span className="font-medium">{item.name || item.slug}</span>
+                        <span className="text-xs text-muted-foreground">/{item.slug}</span>
+                      </div>
+                    </TableCell>
+                    <TableCell><Badge variant={item.role === "admin" ? "default" : "outline"}>{item.role}</Badge></TableCell>
+                    <TableCell><Badge variant={item.enabled ? "secondary" : "destructive"}>{item.enabled ? "启用" : "禁用"}</Badge></TableCell>
+                    <TableCell className="text-muted-foreground">{formatTime(item.lastLoginAt)}</TableCell>
+                    <TableCell className="text-right">
+                      {item.role === "admin" ? (
+                        <Button variant="ghost" size="sm" disabled>固定启用</Button>
+                      ) : (
+                        <Button variant="outline" size="sm" onClick={() => setUserEnabled(item, !item.enabled)}>
+                          {item.enabled ? "禁用" : "启用"}
+                        </Button>
+                      )}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+
 function SettingsView({
   api,
   settings,
@@ -1689,11 +2023,11 @@ function SettingsView({
         <CardHeader>
           <div className="flex items-start justify-between gap-3">
             <div>
-              <CardTitle>用户 token</CardTitle>
-              <CardDescription>用于保护 /s/slug 公开订阅地址，清空后恢复无需 token 访问。</CardDescription>
+              <CardTitle>公开订阅 token</CardTitle>
+              <CardDescription>可选，用于给公开订阅地址增加访问 token。</CardDescription>
             </div>
-            <Badge variant={userTokenEnabled ? "secondary" : "outline"}>
-              <LockIcon />
+            <Badge variant={userTokenEnabled ? "default" : "outline"}>
+              <KeyRoundIcon />
               {userTokenEnabled ? "已启用" : "未启用"}
             </Badge>
           </div>
@@ -1797,6 +2131,39 @@ function createAPI(token: string) {
 }
 
 type API = ReturnType<typeof createAPI>
+
+function readStoredUser(): User | null {
+  const value = localStorage.getItem("sub-nest-user")
+  if (!value) {
+    return null
+  }
+  try {
+    return JSON.parse(value) as User
+  } catch {
+    localStorage.removeItem("sub-nest-user")
+    return null
+  }
+}
+
+function withScope(path: string, scopeQuery: string) {
+  if (!scopeQuery) {
+    return path
+  }
+  const [base, query = ""] = path.split("?")
+  const scope = scopeQuery.replace(/^\?/, "")
+  return `${base}?${[query, scope].filter(Boolean).join("&")}`
+}
+
+function publicBaseFromExample(example?: string) {
+  if (!example) {
+    return window.location.origin
+  }
+  const userScoped = example.match(/^(.*\/u\/[^/]+)\/s\/[^/]+$/)
+  if (userScoped) {
+    return userScoped[1]
+  }
+  return example.replace(/\/s\/[^/]+$/, "")
+}
 
 async function request<T>(path: string, init: RequestInit, token: string): Promise<T> {
   const response = await fetch(path, {
