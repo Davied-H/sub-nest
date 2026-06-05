@@ -3,25 +3,27 @@ package domain
 import "time"
 
 type Source struct {
-	ID              string     `json:"id"`
-	OwnerUserID     string     `json:"ownerUserId,omitempty"`
-	Name            string     `json:"name"`
-	URL             string     `json:"url"`
-	SourceType      string     `json:"sourceType,omitempty"`
-	FileName        string     `json:"fileName,omitempty"`
-	FileContent     string     `json:"fileContent,omitempty"`
-	Enabled         bool       `json:"enabled"`
-	Remark          string     `json:"remark"`
-	Tags            []string   `json:"tags"`
-	LastStatus      string     `json:"lastStatus"`
-	LastFormat      string     `json:"lastFormat"`
-	LastNodeCount   int        `json:"lastNodeCount"`
-	LastError       string     `json:"lastError"`
-	RefreshProgress string     `json:"refreshProgress"`
-	RefreshPercent  int        `json:"refreshPercent"`
-	LastRefreshedAt *time.Time `json:"lastRefreshedAt,omitempty"`
-	LastSuccessAt   *time.Time `json:"lastSuccessAt,omitempty"`
-	CachedNodes     []Node     `json:"cachedNodes,omitempty"`
+	ID              string             `json:"id"`
+	OwnerUserID     string             `json:"ownerUserId,omitempty"`
+	Name            string             `json:"name"`
+	URL             string             `json:"url"`
+	SourceType      string             `json:"sourceType,omitempty"`
+	FileName        string             `json:"fileName,omitempty"`
+	FileContent     string             `json:"fileContent,omitempty"`
+	TrafficQuery    TrafficQueryConfig `json:"trafficQuery"`
+	TrafficInfo     TrafficInfo        `json:"trafficInfo"`
+	Enabled         bool               `json:"enabled"`
+	Remark          string             `json:"remark"`
+	Tags            []string           `json:"tags"`
+	LastStatus      string             `json:"lastStatus"`
+	LastFormat      string             `json:"lastFormat"`
+	LastNodeCount   int                `json:"lastNodeCount"`
+	LastError       string             `json:"lastError"`
+	RefreshProgress string             `json:"refreshProgress"`
+	RefreshPercent  int                `json:"refreshPercent"`
+	LastRefreshedAt *time.Time         `json:"lastRefreshedAt,omitempty"`
+	LastSuccessAt   *time.Time         `json:"lastSuccessAt,omitempty"`
+	CachedNodes     []Node             `json:"cachedNodes,omitempty"`
 }
 
 type Output struct {
@@ -50,6 +52,35 @@ type FilterRules struct {
 type RenameRule struct {
 	Pattern     string `json:"pattern"`
 	Replacement string `json:"replacement"`
+}
+
+type TrafficQueryConfig struct {
+	Mode    string            `json:"mode"`
+	URL     string            `json:"url,omitempty"`
+	Method  string            `json:"method,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
+	Body    string            `json:"body,omitempty"`
+	Parser  TrafficParser     `json:"parser,omitempty"`
+}
+
+type TrafficParser struct {
+	Type      string `json:"type,omitempty"`
+	Upload    string `json:"upload,omitempty"`
+	Download  string `json:"download,omitempty"`
+	Total     string `json:"total,omitempty"`
+	Remaining string `json:"remaining,omitempty"`
+	Expire    string `json:"expire,omitempty"`
+}
+
+type TrafficInfo struct {
+	UploadBytes    int64      `json:"uploadBytes"`
+	DownloadBytes  int64      `json:"downloadBytes"`
+	TotalBytes     int64      `json:"totalBytes"`
+	RemainingBytes int64      `json:"remainingBytes"`
+	ExpireAt       *time.Time `json:"expireAt,omitempty"`
+	LastCheckedAt  *time.Time `json:"lastCheckedAt,omitempty"`
+	LastStatus     string     `json:"lastStatus"`
+	LastError      string     `json:"lastError"`
 }
 
 type Node struct {
@@ -117,26 +148,28 @@ type Config struct {
 }
 
 type SourceView struct {
-	ID              string        `json:"id"`
-	Name            string        `json:"name"`
-	URLMasked       string        `json:"urlMasked"`
-	URL             string        `json:"url,omitempty"`
-	FileContent     string        `json:"fileContent,omitempty"`
-	SourceType      string        `json:"sourceType,omitempty"`
-	FileName        string        `json:"fileName,omitempty"`
-	Enabled         bool          `json:"enabled"`
-	Remark          string        `json:"remark"`
-	Tags            []string      `json:"tags"`
-	LastStatus      string        `json:"lastStatus"`
-	LastFormat      string        `json:"lastFormat"`
-	LastNodeCount   int           `json:"lastNodeCount"`
-	LastError       string        `json:"lastError"`
-	RefreshProgress string        `json:"refreshProgress"`
-	RefreshPercent  int           `json:"refreshPercent"`
-	LastRefreshedAt *time.Time    `json:"lastRefreshedAt,omitempty"`
-	LastSuccessAt   *time.Time    `json:"lastSuccessAt,omitempty"`
-	NodeStats       NodeStats     `json:"nodeStats"`
-	Nodes           []NodePreview `json:"nodes,omitempty"`
+	ID              string             `json:"id"`
+	Name            string             `json:"name"`
+	URLMasked       string             `json:"urlMasked"`
+	URL             string             `json:"url,omitempty"`
+	FileContent     string             `json:"fileContent,omitempty"`
+	SourceType      string             `json:"sourceType,omitempty"`
+	FileName        string             `json:"fileName,omitempty"`
+	TrafficQuery    TrafficQueryConfig `json:"trafficQuery"`
+	TrafficInfo     TrafficInfo        `json:"trafficInfo"`
+	Enabled         bool               `json:"enabled"`
+	Remark          string             `json:"remark"`
+	Tags            []string           `json:"tags"`
+	LastStatus      string             `json:"lastStatus"`
+	LastFormat      string             `json:"lastFormat"`
+	LastNodeCount   int                `json:"lastNodeCount"`
+	LastError       string             `json:"lastError"`
+	RefreshProgress string             `json:"refreshProgress"`
+	RefreshPercent  int                `json:"refreshPercent"`
+	LastRefreshedAt *time.Time         `json:"lastRefreshedAt,omitempty"`
+	LastSuccessAt   *time.Time         `json:"lastSuccessAt,omitempty"`
+	NodeStats       NodeStats          `json:"nodeStats"`
+	Nodes           []NodePreview      `json:"nodes,omitempty"`
 }
 
 type NodeStats struct {

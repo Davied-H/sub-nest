@@ -33,6 +33,8 @@ func SourceToView(source Source, includeURL bool) SourceView {
 		URLMasked:       sourceDisplay(source),
 		SourceType:      normalizedSourceType(source),
 		FileName:        source.FileName,
+		TrafficQuery:    source.TrafficQuery,
+		TrafficInfo:     source.TrafficInfo,
 		Enabled:         source.Enabled,
 		Remark:          source.Remark,
 		Tags:            source.Tags,

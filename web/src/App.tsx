@@ -110,6 +110,8 @@ type Source = {
   sourceType?: "url" | "file"
   fileName?: string
   fileContent?: string
+  trafficQuery: TrafficQuery
+  trafficInfo: TrafficInfo
   urlMasked: string
   enabled: boolean
   remark: string
@@ -144,6 +146,33 @@ type Source = {
     probeStatus: string
     probeError: string
   }>
+}
+
+type TrafficQuery = {
+  mode: "disabled" | "subscription-header" | "subscription-body-regex" | "custom-http"
+  url?: string
+  method?: string
+  headers?: Record<string, string>
+  body?: string
+  parser?: {
+    type?: "json-path" | "regex" | "subscription-header"
+    upload?: string
+    download?: string
+    total?: string
+    remaining?: string
+    expire?: string
+  }
+}
+
+type TrafficInfo = {
+  uploadBytes: number
+  downloadBytes: number
+  totalBytes: number
+  remainingBytes: number
+  expireAt?: string
+  lastCheckedAt?: string
+  lastStatus: string
+  lastError: string
 }
 
 type Output = {
@@ -235,6 +264,19 @@ const defaultSource: Source = {
   sourceType: "url",
   fileName: "",
   fileContent: "",
+  trafficQuery: {
+    mode: "disabled",
+    method: "GET",
+    parser: { type: "json-path" },
+  },
+  trafficInfo: {
+    uploadBytes: 0,
+    downloadBytes: 0,
+    totalBytes: 0,
+    remainingBytes: 0,
+    lastStatus: "",
+    lastError: "",
+  },
   urlMasked: "",
   enabled: true,
   remark: "",
@@ -899,6 +941,7 @@ function SourcesView({
                   <TableHead>状态</TableHead>
                   <TableHead>格式</TableHead>
                   <TableHead>节点</TableHead>
+                  <TableHead>流量</TableHead>
                   <TableHead>订阅链接</TableHead>
                   <TableHead className="text-right">操作</TableHead>
                 </TableRow>
@@ -949,6 +992,9 @@ function SourcesView({
                         <Badge variant="outline">未测 {source.nodeStats?.unchecked ?? 0}</Badge>
                       </div>
                     </TableCell>
+                    <TableCell className="min-w-48">
+                      <TrafficSummary source={source} />
+                    </TableCell>
                     <TableCell className="max-w-64 truncate text-muted-foreground">{source.urlMasked}</TableCell>
                     <TableCell>
                       <div className="flex justify-end gap-2">
@@ -965,7 +1011,7 @@ function SourcesView({
                   </TableRow>
                   {expanded[source.id] ? (
                     <TableRow key={`${source.id}-nodes`}>
-                      <TableCell colSpan={6}>
+                      <TableCell colSpan={7}>
                         <SourceNodesTable nodes={source.nodes ?? []} />
                       </TableCell>
                     </TableRow>
@@ -978,7 +1024,10 @@ function SourcesView({
         )}
       </CardContent>
       <SourceSheet
+        api={api}
+        scopeQuery={scopeQuery}
         source={editing}
+        reload={reload}
         onOpenChange={(open) => !open && setEditing(null)}
         onSave={async (source) => {
           try {
@@ -1055,6 +1104,36 @@ function SourceNodesTable({ nodes }: { nodes: NonNullable<Source["nodes"]> }) {
   )
 }
 
+function TrafficSummary({ source }: { source: Source }) {
+  const mode = source.trafficQuery?.mode ?? "disabled"
+  const info = source.trafficInfo
+  if (mode === "disabled") {
+    return <span className="text-sm text-muted-foreground">未配置</span>
+  }
+  if (info?.lastStatus === "error") {
+    return (
+      <div className="flex max-w-52 flex-col gap-1">
+        <Badge variant="destructive">查询失败</Badge>
+        <span className="truncate text-xs text-muted-foreground">{info.lastError}</span>
+      </div>
+    )
+  }
+  const remaining = info?.remainingBytes ? formatBytes(info.remainingBytes) : "-"
+  const total = info?.totalBytes ? formatBytes(info.totalBytes) : ""
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex flex-wrap gap-1.5">
+        <Badge variant={info?.lastStatus === "ok" ? "secondary" : "outline"}>
+          剩余 {remaining}{total ? ` / ${total}` : ""}
+        </Badge>
+      </div>
+      <span className="text-xs text-muted-foreground">
+        {info?.expireAt ? `到期 ${formatDate(info.expireAt)}` : info?.lastCheckedAt ? `查询 ${formatTime(info.lastCheckedAt)}` : "尚未查询"}
+      </span>
+    </div>
+  )
+}
+
 function ProgressBar({ value }: { value: number }) {
   const percent = Math.max(1, Math.min(100, Math.round(value)))
   return (
@@ -1065,17 +1144,26 @@ function ProgressBar({ value }: { value: number }) {
 }
 
 function SourceSheet({
+  api,
+  scopeQuery,
   source,
+  reload,
   onOpenChange,
   onSave,
 }: {
+  api: API
+  scopeQuery: string
   source: Source | null
+  reload: (options?: { silent?: boolean }) => Promise<void>
   onOpenChange: (open: boolean) => void
   onSave: (source: Source) => Promise<void>
 }) {
   const [draft, setDraft] = useState<Source>(defaultSource)
+  const [trafficBusy, setTrafficBusy] = useState(false)
   const open = Boolean(source)
   const sourceType = draft.sourceType ?? "url"
+  const trafficQuery = draft.trafficQuery ?? defaultSource.trafficQuery
+  const trafficParser = trafficQuery.parser ?? {}
 
   useEffect(() => {
     setDraft(source ?? defaultSource)
@@ -1095,6 +1183,62 @@ function SourceSheet({
       name: current.name || file.name.replace(/\.[^.]+$/, ""),
     }))
     toast.success(`已读取文件「${file.name}」`)
+  }
+
+  function updateTrafficQuery(next: Partial<TrafficQuery>) {
+    setDraft((current) => ({
+      ...current,
+      trafficQuery: {
+        ...(current.trafficQuery ?? defaultSource.trafficQuery),
+        ...next,
+      },
+    }))
+  }
+
+  function updateTrafficParser(next: Partial<NonNullable<TrafficQuery["parser"]>>) {
+    setDraft((current) => ({
+      ...current,
+      trafficQuery: {
+        ...(current.trafficQuery ?? defaultSource.trafficQuery),
+        parser: {
+          ...(current.trafficQuery?.parser ?? {}),
+          ...next,
+        },
+      },
+    }))
+  }
+
+  function updateTrafficHeaders(value: string) {
+    const headers: Record<string, string> = {}
+    for (const line of value.split("\n")) {
+      const [key, ...rest] = line.split(":")
+      if (key?.trim()) {
+        headers[key.trim()] = rest.join(":").trim()
+      }
+    }
+    updateTrafficQuery({ headers })
+  }
+
+  async function testTrafficQuery() {
+    if (!draft.id) {
+      toast.error("请先保存订阅源后再测试流量查询")
+      return
+    }
+    setTrafficBusy(true)
+    try {
+      const updated = await api.post<Source>(withScope(`/api/sources/${draft.id}/traffic-query`, scopeQuery), {})
+      setDraft(updated)
+      if (updated.trafficInfo?.lastStatus === "error") {
+        toast.error(updated.trafficInfo.lastError || "流量查询失败")
+      } else {
+        toast.success("流量查询完成")
+      }
+      await reload({ silent: true })
+    } catch (error) {
+      toast.error(messageOf(error))
+    } finally {
+      setTrafficBusy(false)
+    }
   }
 
   return (
@@ -1166,9 +1310,121 @@ function SourceSheet({
               </div>
               <Switch checked={draft.enabled} onCheckedChange={(checked) => setDraft({ ...draft, enabled: checked })} />
             </Field>
+            <Separator />
+            <Field>
+              <FieldLabel>流量查询</FieldLabel>
+              <Select
+                value={trafficQuery.mode || "disabled"}
+                onValueChange={(value) => updateTrafficQuery({ mode: String(value) as TrafficQuery["mode"] })}
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    <SelectItem value="disabled">不查询</SelectItem>
+                    <SelectItem value="subscription-header">读取订阅响应头</SelectItem>
+                    <SelectItem value="subscription-body-regex">订阅正文正则</SelectItem>
+                    <SelectItem value="custom-http">自定义 HTTP</SelectItem>
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+              <FieldDescription>刷新订阅源时会同步更新流量；查询失败不会影响节点缓存。</FieldDescription>
+            </Field>
+            {trafficQuery.mode === "custom-http" ? (
+              <>
+                <Field>
+                  <FieldLabel htmlFor="traffic-url">查询 URL</FieldLabel>
+                  <Input id="traffic-url" value={trafficQuery.url ?? ""} onChange={(event) => updateTrafficQuery({ url: event.target.value })} />
+                </Field>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <Field>
+                    <FieldLabel>请求方法</FieldLabel>
+                    <Select value={trafficQuery.method || "GET"} onValueChange={(value) => updateTrafficQuery({ method: String(value) })}>
+                      <SelectTrigger><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectGroup>
+                          <SelectItem value="GET">GET</SelectItem>
+                          <SelectItem value="POST">POST</SelectItem>
+                        </SelectGroup>
+                      </SelectContent>
+                    </Select>
+                  </Field>
+                  <Field>
+                    <FieldLabel>解析方式</FieldLabel>
+                    <Select value={trafficParser.type || "json-path"} onValueChange={(value) => updateTrafficParser({ type: String(value) as NonNullable<TrafficQuery["parser"]>["type"] })}>
+                      <SelectTrigger><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        <SelectGroup>
+                          <SelectItem value="json-path">JSON 路径</SelectItem>
+                          <SelectItem value="regex">正则</SelectItem>
+                          <SelectItem value="subscription-header">响应头</SelectItem>
+                        </SelectGroup>
+                      </SelectContent>
+                    </Select>
+                  </Field>
+                </div>
+                <Field>
+                  <FieldLabel htmlFor="traffic-headers">请求头</FieldLabel>
+                  <Textarea
+                    id="traffic-headers"
+                    className="min-h-20 font-mono text-xs"
+                    value={headersToText(trafficQuery.headers)}
+                    onChange={(event) => updateTrafficHeaders(event.target.value)}
+                    placeholder={"Authorization: Bearer xxx\nCookie: uid=..."}
+                  />
+                </Field>
+                {trafficQuery.method === "POST" ? (
+                  <Field>
+                    <FieldLabel htmlFor="traffic-body">请求体</FieldLabel>
+                    <Textarea id="traffic-body" className="min-h-20 font-mono text-xs" value={trafficQuery.body ?? ""} onChange={(event) => updateTrafficQuery({ body: event.target.value })} />
+                  </Field>
+                ) : null}
+              </>
+            ) : null}
+            {trafficQuery.mode === "subscription-body-regex" || (trafficQuery.mode === "custom-http" && (trafficParser.type ?? "json-path") !== "subscription-header") ? (
+              <div className="grid gap-3 sm:grid-cols-2">
+                <Field>
+                  <FieldLabel htmlFor="traffic-remaining">{trafficParser.type === "regex" || trafficQuery.mode === "subscription-body-regex" ? "剩余正则" : "剩余 JSON 路径"}</FieldLabel>
+                  <Input id="traffic-remaining" value={trafficParser.remaining ?? ""} onChange={(event) => updateTrafficParser({ remaining: event.target.value })} placeholder={trafficParser.type === "regex" ? "剩余[:：]\\s*([0-9.]+\\s*GB)" : "$.data.remaining"} />
+                </Field>
+                <Field>
+                  <FieldLabel htmlFor="traffic-total">{trafficParser.type === "regex" || trafficQuery.mode === "subscription-body-regex" ? "总量正则" : "总量 JSON 路径"}</FieldLabel>
+                  <Input id="traffic-total" value={trafficParser.total ?? ""} onChange={(event) => updateTrafficParser({ total: event.target.value })} placeholder={trafficParser.type === "regex" ? "总量[:：]\\s*([0-9.]+\\s*GB)" : "$.data.total"} />
+                </Field>
+                <Field>
+                  <FieldLabel htmlFor="traffic-upload">{trafficParser.type === "regex" || trafficQuery.mode === "subscription-body-regex" ? "上传正则" : "上传 JSON 路径"}</FieldLabel>
+                  <Input id="traffic-upload" value={trafficParser.upload ?? ""} onChange={(event) => updateTrafficParser({ upload: event.target.value })} placeholder={trafficParser.type === "regex" ? "上传[:：]\\s*([0-9.]+\\s*GB)" : "$.data.upload"} />
+                </Field>
+                <Field>
+                  <FieldLabel htmlFor="traffic-download">{trafficParser.type === "regex" || trafficQuery.mode === "subscription-body-regex" ? "下载正则" : "下载 JSON 路径"}</FieldLabel>
+                  <Input id="traffic-download" value={trafficParser.download ?? ""} onChange={(event) => updateTrafficParser({ download: event.target.value })} placeholder={trafficParser.type === "regex" ? "下载[:：]\\s*([0-9.]+\\s*GB)" : "$.data.download"} />
+                </Field>
+                <Field className="sm:col-span-2">
+                  <FieldLabel htmlFor="traffic-expire">{trafficParser.type === "regex" || trafficQuery.mode === "subscription-body-regex" ? "到期正则" : "到期 JSON 路径"}</FieldLabel>
+                  <Input id="traffic-expire" value={trafficParser.expire ?? ""} onChange={(event) => updateTrafficParser({ expire: event.target.value })} placeholder={trafficParser.type === "regex" ? "到期[:：]\\s*([0-9-]+)" : "$.data.expire"} />
+                </Field>
+              </div>
+            ) : null}
+            {trafficQuery.mode !== "disabled" ? (
+              <Alert>
+                <DatabaseBackupIcon />
+                <AlertTitle>{trafficStatusTitle(draft.trafficInfo)}</AlertTitle>
+                <AlertDescription className="flex flex-col gap-1">
+                  <span>{trafficInfoText(draft.trafficInfo)}</span>
+                  {draft.trafficInfo?.lastError ? <span className="text-destructive">{draft.trafficInfo.lastError}</span> : null}
+                </AlertDescription>
+              </Alert>
+            ) : null}
           </FieldGroup>
         </div>
-        <SheetFooter>
+        <SheetFooter className="flex flex-wrap gap-2">
+          {trafficQuery.mode !== "disabled" ? (
+            <Button type="button" variant="outline" disabled={trafficBusy || !draft.id} onClick={testTrafficQuery}>
+              {trafficBusy ? <Loader2Icon data-icon="inline-start" /> : <RefreshCcwIcon data-icon="inline-start" />}
+              测试流量查询
+            </Button>
+          ) : null}
           <Button disabled={!draft.name || (sourceType === "file" ? !draft.fileContent : !draft.url)} onClick={() => onSave(draft)}>
             <SaveIcon data-icon="inline-start" />
             保存
@@ -2197,6 +2453,59 @@ function formatTime(value?: string) {
     hour: "2-digit",
     minute: "2-digit",
   }).format(new Date(value))
+}
+
+function formatDate(value?: string) {
+  if (!value) {
+    return "-"
+  }
+  return new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date(value))
+}
+
+function formatBytes(value?: number) {
+  const n = Number(value ?? 0)
+  if (!Number.isFinite(n) || n <= 0) {
+    return "-"
+  }
+  const units = ["B", "KB", "MB", "GB", "TB", "PB"]
+  let size = n
+  let index = 0
+  while (size >= 1024 && index < units.length - 1) {
+    size /= 1024
+    index += 1
+  }
+  return `${size >= 10 || index === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[index]}`
+}
+
+function headersToText(headers?: Record<string, string>) {
+  return Object.entries(headers ?? {}).map(([key, value]) => `${key}: ${value}`).join("\n")
+}
+
+function trafficStatusTitle(info?: TrafficInfo) {
+  if (info?.lastStatus === "ok") {
+    return "最近查询成功"
+  }
+  if (info?.lastStatus === "error") {
+    return "最近查询失败"
+  }
+  return "尚未查询流量"
+}
+
+function trafficInfoText(info?: TrafficInfo) {
+  if (!info || (!info.remainingBytes && !info.totalBytes && !info.uploadBytes && !info.downloadBytes && !info.expireAt)) {
+    return "保存配置后可手动测试，刷新订阅源时也会自动查询。"
+  }
+  const parts = [
+    info.remainingBytes ? `剩余 ${formatBytes(info.remainingBytes)}` : "",
+    info.totalBytes ? `总量 ${formatBytes(info.totalBytes)}` : "",
+    info.uploadBytes || info.downloadBytes ? `已用 ${formatBytes((info.uploadBytes ?? 0) + (info.downloadBytes ?? 0))}` : "",
+    info.expireAt ? `到期 ${formatDate(info.expireAt)}` : "",
+  ].filter(Boolean)
+  return parts.join("，")
 }
 
 async function copyText(value: string, message = "已复制") {

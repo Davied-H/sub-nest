@@ -72,6 +72,7 @@ func (s *Server) Routes() http.Handler {
 	mux.Handle("PUT /api/sources/{id}", s.auth(http.HandlerFunc(s.handleUpdateSource)))
 	mux.Handle("DELETE /api/sources/{id}", s.auth(http.HandlerFunc(s.handleDeleteSource)))
 	mux.Handle("POST /api/sources/{id}/refresh", s.auth(http.HandlerFunc(s.handleRefreshSource)))
+	mux.Handle("POST /api/sources/{id}/traffic-query", s.auth(http.HandlerFunc(s.handleQuerySourceTraffic)))
 	mux.Handle("POST /api/refresh", s.auth(http.HandlerFunc(s.handleRefreshAll)))
 
 	mux.Handle("GET /api/outputs", s.auth(http.HandlerFunc(s.handleOutputs)))
@@ -570,6 +571,7 @@ func (s *Server) handleUpdateSource(w http.ResponseWriter, r *http.Request) {
 				cfg.Sources[i].Enabled = req.Enabled
 				cfg.Sources[i].Remark = req.Remark
 				cfg.Sources[i].Tags = req.Tags
+				cfg.Sources[i].TrafficQuery = req.TrafficQuery
 				updated = cfg.Sources[i]
 				return nil
 			}
@@ -587,6 +589,13 @@ func normalizeSourceInput(source *domain.Source) {
 	source.Name = strings.TrimSpace(source.Name)
 	source.URL = strings.TrimSpace(source.URL)
 	source.FileName = strings.TrimSpace(source.FileName)
+	source.TrafficQuery.Mode = strings.TrimSpace(source.TrafficQuery.Mode)
+	source.TrafficQuery.URL = strings.TrimSpace(source.TrafficQuery.URL)
+	source.TrafficQuery.Method = strings.ToUpper(strings.TrimSpace(source.TrafficQuery.Method))
+	if source.TrafficQuery.Method == "" {
+		source.TrafficQuery.Method = http.MethodGet
+	}
+	source.TrafficQuery.Parser.Type = strings.TrimSpace(source.TrafficQuery.Parser.Type)
 	if source.SourceType != "file" {
 		source.SourceType = "url"
 		source.FileName = ""
@@ -654,6 +663,21 @@ func (s *Server) handleRefreshSource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusAccepted, domain.SourceToView(source, false))
+}
+
+func (s *Server) handleQuerySourceTraffic(w http.ResponseWriter, r *http.Request) {
+	ownerID, _, ok := s.resolveOwner(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "用户不存在或已禁用")
+		return
+	}
+	source, info, err := s.querySourceTraffic(ownerID, r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	source.TrafficInfo = info
+	writeJSON(w, http.StatusOK, domain.SourceToView(source, false))
 }
 
 func (s *Server) handleRefreshAll(w http.ResponseWriter, r *http.Request) {
@@ -1004,6 +1028,13 @@ func (s *Server) refreshSource(ownerID string, id string) (domain.Source, error)
 	if refreshErr != nil {
 		s.logger.Warn("refresh source failed", "source", source.Name, "error", refreshErr)
 	}
+	if refreshErr == nil && refreshed.TrafficQuery.Mode != "" && refreshed.TrafficQuery.Mode != "disabled" {
+		info, err := s.fetcher.QueryTraffic(refreshed)
+		refreshed.TrafficInfo = info
+		if err != nil {
+			s.logger.Warn("query source traffic failed", "source", source.Name, "error", err)
+		}
+	}
 	err := s.store.Update(func(cfg *domain.Config) error {
 		for i := range cfg.Sources {
 			if cfg.Sources[i].ID == id && cfg.Sources[i].OwnerUserID == ownerID {
@@ -1018,6 +1049,40 @@ func (s *Server) refreshSource(ownerID string, id string) (domain.Source, error)
 		return errors.New("not found")
 	})
 	return refreshed, err
+}
+
+func (s *Server) querySourceTraffic(ownerID string, id string) (domain.Source, domain.TrafficInfo, error) {
+	cfg := s.store.Snapshot()
+	var source domain.Source
+	found := false
+	for _, item := range cfg.Sources {
+		if item.ID == id && item.OwnerUserID == ownerID {
+			source = item
+			found = true
+			break
+		}
+	}
+	if !found {
+		return domain.Source{}, domain.TrafficInfo{}, errors.New("订阅源不存在")
+	}
+	info, queryErr := s.fetcher.QueryTraffic(source)
+	err := s.store.Update(func(cfg *domain.Config) error {
+		for i := range cfg.Sources {
+			if cfg.Sources[i].ID == id && cfg.Sources[i].OwnerUserID == ownerID {
+				cfg.Sources[i].TrafficInfo = info
+				source = cfg.Sources[i]
+				return nil
+			}
+		}
+		return errors.New("not found")
+	})
+	if err != nil {
+		return domain.Source{}, info, err
+	}
+	if queryErr != nil {
+		return source, info, nil
+	}
+	return source, info, nil
 }
 
 func (s *Server) startRefreshSource(ownerID string, id string) (domain.Source, error) {

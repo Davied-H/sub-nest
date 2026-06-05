@@ -135,6 +135,39 @@ func TestAdminCanManageTargetUser(t *testing.T) {
 	requestJSON(t, app, http.MethodGet, "/u/alice/s/main", "", nil, http.StatusNotFound, nil)
 }
 
+func TestQuerySourceTraffic(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Subscription-Userinfo", "upload=10; download=20; total=100; expire=1893456000")
+		_, _ = w.Write([]byte("ss://example"))
+	}))
+	defer upstream.Close()
+
+	app, _ := newTestServer(t)
+	adminToken := setupAdmin(t, app, "admin-token-traffic")
+	var created map[string]interface{}
+	requestJSON(t, app, http.MethodPost, "/api/sources", adminToken, map[string]interface{}{
+		"name":       "traffic-source",
+		"url":        upstream.URL,
+		"sourceType": "url",
+		"enabled":    true,
+		"tags":       []string{},
+		"trafficQuery": map[string]interface{}{
+			"mode": "subscription-header",
+		},
+	}, http.StatusCreated, &created)
+	sourceID := stringValue(created["id"])
+
+	var queried map[string]interface{}
+	requestJSON(t, app, http.MethodPost, "/api/sources/"+sourceID+"/traffic-query", adminToken, nil, http.StatusOK, &queried)
+	info, ok := queried["trafficInfo"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("trafficInfo missing: %#v", queried)
+	}
+	if info["lastStatus"] != "ok" || info["remainingBytes"].(float64) != 70 {
+		t.Fatalf("unexpected traffic info: %#v", info)
+	}
+}
+
 func newTestServer(t *testing.T) (http.Handler, *store.Store) {
 	t.Helper()
 	st, err := store.New(filepath.Join(t.TempDir(), "config.json"))
