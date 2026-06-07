@@ -26,6 +26,7 @@ import (
 type exitIPResponse struct {
 	IP      string `json:"ip"`
 	Country string `json:"country"`
+	DelayMS int    `json:"delayMs"`
 }
 
 type ProbeProgressFunc func(done int, total int, node domain.Node)
@@ -154,6 +155,7 @@ func probeNodeRegion(bin string, node *domain.Node) error {
 			node.Region = info.Group
 			node.RegionCode = info.Code
 			node.ExitIP = resp.IP
+			node.DelayMS = resp.DelayMS
 			node.RegionSource = "probe"
 			node.ProbeStatus = "ok"
 			node.ProbeError = ""
@@ -209,6 +211,7 @@ func fetchExitIP(client *http.Client) (exitIPResponse, error) {
 		"https://api.country.is/",
 		"https://api.ipify.org?format=json",
 	} {
+		started := time.Now()
 		req, _ := http.NewRequest(http.MethodGet, endpoint, nil)
 		req.Header.Set("User-Agent", "sub-nest/0.1")
 		resp, err := client.Do(req)
@@ -217,6 +220,7 @@ func fetchExitIP(client *http.Client) (exitIPResponse, error) {
 		}
 		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
 		_ = resp.Body.Close()
+		delayMS := int(time.Since(started).Milliseconds())
 		if readErr != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			continue
 		}
@@ -227,7 +231,7 @@ func fetchExitIP(client *http.Client) (exitIPResponse, error) {
 		ip := stringValue(payload["ip"])
 		country := stringValue(payload["country"])
 		if ip != "" {
-			return exitIPResponse{IP: ip, Country: country}, nil
+			return exitIPResponse{IP: ip, Country: country, DelayMS: max(1, delayMS)}, nil
 		}
 	}
 	return exitIPResponse{}, errors.New("cannot fetch exit ip through proxy")

@@ -16,6 +16,7 @@ import (
 )
 
 const trafficQueryLimit = 2 * 1024 * 1024
+const trafficDebugPreviewLimit = 2048
 
 func (f *Fetcher) QueryTraffic(source domain.Source) (domain.TrafficInfo, error) {
 	cfg := normalizeTrafficQuery(source)
@@ -24,6 +25,7 @@ func (f *Fetcher) QueryTraffic(source domain.Source) (domain.TrafficInfo, error)
 	info.LastCheckedAt = &now
 	info.LastStatus = "checking"
 	info.LastError = ""
+	info.Debug = nil
 
 	if cfg.Mode == "" || cfg.Mode == "disabled" {
 		info.LastStatus = ""
@@ -89,10 +91,13 @@ func (f *Fetcher) queryTrafficFromSubscriptionHeader(source domain.Source, info 
 		return info, errors.New("文件订阅不支持自动读取响应头")
 	}
 	resp, err := f.doTrafficRequest(http.MethodGet, source.URL, nil, nil)
+	info.Debug = trafficDebugFromRequest(http.MethodGet, source.URL, "subscription-header")
 	if err != nil {
+		info.Debug.Status = err.Error()
 		return info, err
 	}
 	defer resp.Body.Close()
+	fillTrafficDebugResponse(info.Debug, resp, nil)
 	if err := checkTrafficStatus(resp); err != nil {
 		return info, err
 	}
@@ -104,14 +109,18 @@ func (f *Fetcher) queryTrafficFromSubscriptionBody(source domain.Source, info do
 		return info, errors.New("文件订阅不支持远程正文解析")
 	}
 	resp, err := f.doTrafficRequest(http.MethodGet, source.URL, nil, nil)
+	info.Debug = trafficDebugFromRequest(http.MethodGet, source.URL, "regex")
 	if err != nil {
+		info.Debug.Status = err.Error()
 		return info, err
 	}
 	defer resp.Body.Close()
 	if err := checkTrafficStatus(resp); err != nil {
+		fillTrafficDebugResponse(info.Debug, resp, nil)
 		return info, err
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, trafficQueryLimit))
+	fillTrafficDebugResponse(info.Debug, resp, body)
 	if err != nil {
 		return info, err
 	}
@@ -119,18 +128,22 @@ func (f *Fetcher) queryTrafficFromSubscriptionBody(source domain.Source, info do
 }
 
 func (f *Fetcher) queryTrafficFromCustomHTTP(cfg domain.TrafficQueryConfig, info domain.TrafficInfo) (domain.TrafficInfo, error) {
+	info.Debug = trafficDebugFromRequest(cfg.Method, cfg.URL, cfg.Parser.Type)
 	if cfg.URL == "" {
 		return info, errors.New("自定义查询 URL 不能为空")
 	}
 	resp, err := f.doTrafficRequest(cfg.Method, cfg.URL, cfg.Headers, strings.NewReader(cfg.Body))
 	if err != nil {
+		info.Debug.Status = err.Error()
 		return info, err
 	}
 	defer resp.Body.Close()
 	if err := checkTrafficStatus(resp); err != nil {
+		fillTrafficDebugResponse(info.Debug, resp, nil)
 		return info, err
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, trafficQueryLimit))
+	fillTrafficDebugResponse(info.Debug, resp, body)
 	if err != nil {
 		return info, err
 	}
@@ -169,7 +182,38 @@ func checkTrafficStatus(resp *http.Response) error {
 	return nil
 }
 
+func trafficDebugFromRequest(method string, url string, parserType string) *domain.TrafficDebug {
+	return &domain.TrafficDebug{
+		Method:     method,
+		URL:        url,
+		ParserType: parserType,
+	}
+}
+
+func fillTrafficDebugResponse(debug *domain.TrafficDebug, resp *http.Response, body []byte) {
+	if debug == nil || resp == nil {
+		return
+	}
+	debug.Status = resp.Status
+	debug.StatusCode = resp.StatusCode
+	debug.ContentType = resp.Header.Get("Content-Type")
+	if body != nil {
+		debug.BodyPreview = previewTrafficBody(body)
+	}
+}
+
+func previewTrafficBody(body []byte) string {
+	value := strings.TrimSpace(string(body))
+	if len(value) <= trafficDebugPreviewLimit {
+		return value
+	}
+	return value[:trafficDebugPreviewLimit] + "...(truncated)"
+}
+
 func parseSubscriptionUserInfo(value string, info domain.TrafficInfo) (domain.TrafficInfo, error) {
+	if info.Debug != nil {
+		info.Debug.Header = value
+	}
 	if strings.TrimSpace(value) == "" {
 		return info, errors.New("响应头 subscription-userinfo 为空")
 	}
@@ -205,32 +249,53 @@ func parseSubscriptionUserInfo(value string, info domain.TrafficInfo) (domain.Tr
 func parseTrafficByRegex(body string, parser domain.TrafficParser, info domain.TrafficInfo) (domain.TrafficInfo, error) {
 	var found bool
 	var err error
-	if info.UploadBytes, found, err = parseRegexBytes(body, parser.Upload); err != nil {
+	if info.UploadBytes, found, err = parseRegexBytesDebug(body, "已上传", parser.Upload, info.Debug, found); err != nil {
 		return info, fmt.Errorf("解析已上传失败: %w", err)
 	}
-	if info.DownloadBytes, found, err = parseRegexBytesMerge(body, parser.Download, info.DownloadBytes, found); err != nil {
+	if info.DownloadBytes, found, err = parseRegexBytesMergeDebug(body, "已下载", parser.Download, info.DownloadBytes, info.Debug, found); err != nil {
 		return info, fmt.Errorf("解析已下载失败: %w", err)
 	}
-	if info.TotalBytes, found, err = parseRegexBytesMerge(body, parser.Total, info.TotalBytes, found); err != nil {
+	if info.TotalBytes, found, err = parseRegexBytesMergeDebug(body, "总量", parser.Total, info.TotalBytes, info.Debug, found); err != nil {
 		return info, fmt.Errorf("解析总量失败: %w", err)
 	}
-	if info.RemainingBytes, found, err = parseRegexBytesMerge(body, parser.Remaining, info.RemainingBytes, found); err != nil {
+	if info.RemainingBytes, found, err = parseRegexBytesMergeDebug(body, "剩余", parser.Remaining, info.RemainingBytes, info.Debug, found); err != nil {
 		return info, fmt.Errorf("解析剩余失败: %w", err)
 	}
 	if parser.Expire != "" {
 		if value, ok := firstRegexMatch(body, parser.Expire); ok {
+			appendTrafficPathDebug(info.Debug, "到期", parser.Expire, true, value, nil)
 			if t, err := parseTrafficTime(value); err == nil {
 				info.ExpireAt = &t
 				found = true
 			} else {
 				return info, fmt.Errorf("解析到期时间失败: %w", err)
 			}
+		} else {
+			appendTrafficPathDebug(info.Debug, "到期", parser.Expire, false, "", nil)
 		}
 	}
 	if !found {
 		return info, errors.New("未匹配到流量信息")
 	}
 	return info, nil
+}
+
+func parseRegexBytesMergeDebug(body string, label string, pattern string, current int64, debug *domain.TrafficDebug, found bool) (int64, bool, error) {
+	value, ok, err := parseRegexBytesWithValue(body, pattern)
+	if err != nil {
+		appendTrafficPathDebug(debug, label, pattern, false, "", err)
+		return current, found, err
+	}
+	if !ok {
+		appendTrafficPathDebug(debug, label, pattern, false, "", nil)
+		return current, found, nil
+	}
+	appendTrafficPathDebug(debug, label, pattern, true, strconv.FormatInt(value, 10), nil)
+	return value, true, nil
+}
+
+func parseRegexBytesDebug(body string, label string, pattern string, debug *domain.TrafficDebug, found bool) (int64, bool, error) {
+	return parseRegexBytesMergeDebug(body, label, pattern, 0, debug, found)
 }
 
 func parseRegexBytesMerge(body string, pattern string, current int64, found bool) (int64, bool, error) {
@@ -242,6 +307,10 @@ func parseRegexBytesMerge(body string, pattern string, current int64, found bool
 }
 
 func parseRegexBytes(body string, pattern string) (int64, bool, error) {
+	return parseRegexBytesWithValue(body, pattern)
+}
+
+func parseRegexBytesWithValue(body string, pattern string) (int64, bool, error) {
 	if strings.TrimSpace(pattern) == "" {
 		return 0, false, nil
 	}
@@ -277,32 +346,53 @@ func parseTrafficByJSONPath(body []byte, parser domain.TrafficParser, info domai
 	}
 	var found bool
 	var err error
-	if info.UploadBytes, found, err = jsonPathBytes(data, parser.Upload); err != nil {
+	if info.UploadBytes, found, err = jsonPathBytesDebug(data, "已上传", parser.Upload, info.Debug, found); err != nil {
 		return info, fmt.Errorf("解析已上传失败: %w", err)
 	}
-	if info.DownloadBytes, found, err = jsonPathBytesMerge(data, parser.Download, info.DownloadBytes, found); err != nil {
+	if info.DownloadBytes, found, err = jsonPathBytesMergeDebug(data, "已下载", parser.Download, info.DownloadBytes, info.Debug, found); err != nil {
 		return info, fmt.Errorf("解析已下载失败: %w", err)
 	}
-	if info.TotalBytes, found, err = jsonPathBytesMerge(data, parser.Total, info.TotalBytes, found); err != nil {
+	if info.TotalBytes, found, err = jsonPathBytesMergeDebug(data, "总量", parser.Total, info.TotalBytes, info.Debug, found); err != nil {
 		return info, fmt.Errorf("解析总量失败: %w", err)
 	}
-	if info.RemainingBytes, found, err = jsonPathBytesMerge(data, parser.Remaining, info.RemainingBytes, found); err != nil {
+	if info.RemainingBytes, found, err = jsonPathBytesMergeDebug(data, "剩余", parser.Remaining, info.RemainingBytes, info.Debug, found); err != nil {
 		return info, fmt.Errorf("解析剩余失败: %w", err)
 	}
 	if parser.Expire != "" {
 		if value, ok := jsonPathValue(data, parser.Expire); ok {
+			appendTrafficPathDebug(info.Debug, "到期", parser.Expire, true, fmt.Sprint(value), nil)
 			if t, err := parseTrafficTime(fmt.Sprint(value)); err == nil {
 				info.ExpireAt = &t
 				found = true
 			} else {
 				return info, fmt.Errorf("解析到期时间失败: %w", err)
 			}
+		} else {
+			appendTrafficPathDebug(info.Debug, "到期", parser.Expire, false, "", nil)
 		}
 	}
 	if !found {
 		return info, errors.New("未解析到流量信息")
 	}
 	return info, nil
+}
+
+func jsonPathBytesMergeDebug(data interface{}, label string, path string, current int64, debug *domain.TrafficDebug, found bool) (int64, bool, error) {
+	value, ok := jsonPathValue(data, path)
+	if strings.TrimSpace(path) == "" {
+		return current, found, nil
+	}
+	if !ok {
+		appendTrafficPathDebug(debug, label, path, false, "", nil)
+		return current, found, nil
+	}
+	n, err := parseTrafficSize(fmt.Sprint(value))
+	appendTrafficPathDebug(debug, label, path, err == nil, fmt.Sprint(value), err)
+	return n, err == nil || found, err
+}
+
+func jsonPathBytesDebug(data interface{}, label string, path string, debug *domain.TrafficDebug, found bool) (int64, bool, error) {
+	return jsonPathBytesMergeDebug(data, label, path, 0, debug, found)
 }
 
 func jsonPathBytesMerge(data interface{}, path string, current int64, found bool) (int64, bool, error) {
@@ -343,6 +433,30 @@ func jsonPathValue(data interface{}, path string) (interface{}, bool) {
 		}
 	}
 	return current, true
+}
+
+func appendTrafficPathDebug(debug *domain.TrafficDebug, label string, path string, found bool, value string, err error) {
+	if debug == nil || strings.TrimSpace(path) == "" {
+		return
+	}
+	item := domain.TrafficPathDebug{
+		Label: label,
+		Path:  path,
+		Found: found,
+		Value: previewTrafficDebugValue(value),
+	}
+	if err != nil {
+		item.Error = err.Error()
+	}
+	debug.Paths = append(debug.Paths, item)
+}
+
+func previewTrafficDebugValue(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) <= 160 {
+		return value
+	}
+	return value[:160] + "...(truncated)"
 }
 
 func parseTrafficSize(value string) (int64, error) {

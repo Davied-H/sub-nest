@@ -106,6 +106,7 @@ func refreshFromBody(source domain.Source, body []byte, now time.Time, progress 
 			progress("refreshing", fmt.Sprintf("测试出口 %d/%d：%s", done, total, node.Name), percent, parsed.Nodes)
 		}
 	})
+	probedNodes = SortNodesByDelay(probedNodes)
 	source.LastStatus = "ok"
 	source.LastError = ""
 	source.RefreshProgress = ""

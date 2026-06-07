@@ -37,10 +37,81 @@ type Output struct {
 	Filter            FilterRules       `json:"filter"`
 	RenameRules       []RenameRule      `json:"renameRules"`
 	NodeNameOverrides map[string]string `json:"nodeNameOverrides,omitempty"`
+	PAC               PACConfig         `json:"pac"`
 	GroupMode         string            `json:"groupMode"`
 	LastGeneratedAt   *time.Time        `json:"lastGeneratedAt,omitempty"`
 	LastNodeCount     int               `json:"lastNodeCount"`
 	LastDroppedCount  int               `json:"lastDroppedCount"`
+}
+
+type PACConfig struct {
+	Enabled              bool       `json:"enabled"`
+	EnabledSet           bool       `json:"enabledSet,omitempty"`
+	Proxy                string     `json:"proxy"`
+	RuleSetID            string     `json:"ruleSetId,omitempty"`
+	RuleSourceURL        string     `json:"ruleSourceUrl"`
+	RuleSourceFormat     string     `json:"ruleSourceFormat"`
+	RuleRefreshHours     int        `json:"ruleRefreshHours"`
+	DomainKeywords       []string   `json:"domainKeywords,omitempty"`
+	DirectDomainSuffixes []string   `json:"directDomainSuffixes"`
+	DirectCIDRs          []string   `json:"directCidrs"`
+	CachedDomainSuffixes []string   `json:"cachedDomainSuffixes,omitempty"`
+	LastSyncedAt         *time.Time `json:"lastSyncedAt,omitempty"`
+	LastSyncStatus       string     `json:"lastSyncStatus,omitempty"`
+	LastSyncError        string     `json:"lastSyncError,omitempty"`
+}
+
+type RuleSource struct {
+	ID                   string     `json:"id"`
+	OwnerUserID          string     `json:"ownerUserId,omitempty"`
+	Name                 string     `json:"name"`
+	URL                  string     `json:"url"`
+	Format               string     `json:"format"`
+	RefreshHours         int        `json:"refreshHours"`
+	LocalPath            string     `json:"localPath,omitempty"`
+	CachedDomainSuffixes []string   `json:"cachedDomainSuffixes,omitempty"`
+	CachedDomainCount    int        `json:"cachedDomainCount,omitempty"`
+	LastSyncedAt         *time.Time `json:"lastSyncedAt,omitempty"`
+	LastSyncStatus       string     `json:"lastSyncStatus,omitempty"`
+	LastSyncError        string     `json:"lastSyncError,omitempty"`
+}
+
+type RuleSet struct {
+	ID                     string     `json:"id"`
+	OwnerUserID            string     `json:"ownerUserId,omitempty"`
+	Name                   string     `json:"name"`
+	SourceIDs              []string   `json:"sourceIds"`
+	DomainKeywords         []string   `json:"domainKeywords,omitempty"`
+	DirectDomainSuffixes   []string   `json:"directDomainSuffixes"`
+	ExcludedDomainSuffixes []string   `json:"excludedDomainSuffixes,omitempty"`
+	DirectCIDRs            []string   `json:"directCidrs"`
+	CachedDomainSuffixes   []string   `json:"cachedDomainSuffixes,omitempty"`
+	CachedDomainCount      int        `json:"cachedDomainCount,omitempty"`
+	LastSyncedAt           *time.Time `json:"lastSyncedAt,omitempty"`
+	LastSyncStatus         string     `json:"lastSyncStatus,omitempty"`
+	LastSyncError          string     `json:"lastSyncError,omitempty"`
+}
+
+type RuleDomain struct {
+	Domain string `json:"domain"`
+	Source string `json:"source"`
+	Type   string `json:"type"`
+}
+
+type RuleDomainsView struct {
+	RuleSetID   string       `json:"ruleSetId"`
+	RuleSetName string       `json:"ruleSetName"`
+	Query       string       `json:"query"`
+	Total       int          `json:"total"`
+	Matched     int          `json:"matched"`
+	Limit       int          `json:"limit"`
+	Truncated   bool         `json:"truncated"`
+	Domains     []RuleDomain `json:"domains"`
+}
+
+type OutputView struct {
+	Output
+	NodeNames []string `json:"nodeNames"`
 }
 
 type FilterRules struct {
@@ -73,14 +144,35 @@ type TrafficParser struct {
 }
 
 type TrafficInfo struct {
-	UploadBytes    int64      `json:"uploadBytes"`
-	DownloadBytes  int64      `json:"downloadBytes"`
-	TotalBytes     int64      `json:"totalBytes"`
-	RemainingBytes int64      `json:"remainingBytes"`
-	ExpireAt       *time.Time `json:"expireAt,omitempty"`
-	LastCheckedAt  *time.Time `json:"lastCheckedAt,omitempty"`
-	LastStatus     string     `json:"lastStatus"`
-	LastError      string     `json:"lastError"`
+	UploadBytes    int64         `json:"uploadBytes"`
+	DownloadBytes  int64         `json:"downloadBytes"`
+	TotalBytes     int64         `json:"totalBytes"`
+	RemainingBytes int64         `json:"remainingBytes"`
+	ExpireAt       *time.Time    `json:"expireAt,omitempty"`
+	LastCheckedAt  *time.Time    `json:"lastCheckedAt,omitempty"`
+	LastStatus     string        `json:"lastStatus"`
+	LastError      string        `json:"lastError"`
+	Debug          *TrafficDebug `json:"debug,omitempty"`
+}
+
+type TrafficDebug struct {
+	Method      string             `json:"method,omitempty"`
+	URL         string             `json:"url,omitempty"`
+	Status      string             `json:"status,omitempty"`
+	StatusCode  int                `json:"statusCode,omitempty"`
+	ContentType string             `json:"contentType,omitempty"`
+	ParserType  string             `json:"parserType,omitempty"`
+	BodyPreview string             `json:"bodyPreview,omitempty"`
+	Header      string             `json:"header,omitempty"`
+	Paths       []TrafficPathDebug `json:"paths,omitempty"`
+}
+
+type TrafficPathDebug struct {
+	Label string `json:"label"`
+	Path  string `json:"path"`
+	Found bool   `json:"found"`
+	Value string `json:"value,omitempty"`
+	Error string `json:"error,omitempty"`
 }
 
 type Node struct {
@@ -92,6 +184,7 @@ type Node struct {
 	RegionCode     string                 `json:"regionCode,omitempty" yaml:"-"`
 	ResolvedIP     string                 `json:"resolvedIp,omitempty" yaml:"-"`
 	ExitIP         string                 `json:"exitIp,omitempty" yaml:"-"`
+	DelayMS        int                    `json:"delayMs,omitempty" yaml:"-"`
 	Alive          *bool                  `json:"alive,omitempty" yaml:"-"`
 	ExcludedReason string                 `json:"excludedReason,omitempty" yaml:"-"`
 	RegionSource   string                 `json:"regionSource,omitempty" yaml:"-"`
@@ -105,15 +198,18 @@ type Node struct {
 }
 
 type Settings struct {
-	AdminTokenHash string `json:"adminTokenHash"`
-	UserTokenHash  string `json:"userTokenHash"`
-	PublicBaseURL  string `json:"publicBaseUrl"`
-	RefreshMinutes int    `json:"refreshMinutes"`
+	AdminTokenHash      string `json:"adminTokenHash"`
+	UserTokenHash       string `json:"userTokenHash"`
+	PublicBaseURL       string `json:"publicBaseUrl"`
+	RefreshMinutes      int    `json:"refreshMinutes"`
+	TrafficQueryMinutes int    `json:"trafficQueryMinutes"`
 }
 
 type SettingsView struct {
-	PublicBaseURL string `json:"publicBaseUrl"`
-	HasUserToken  bool   `json:"hasUserToken"`
+	PublicBaseURL       string `json:"publicBaseUrl"`
+	HasUserToken        bool   `json:"hasUserToken"`
+	RefreshMinutes      int    `json:"refreshMinutes"`
+	TrafficQueryMinutes int    `json:"trafficQueryMinutes"`
 }
 
 type User struct {
@@ -143,6 +239,8 @@ type Config struct {
 	Users       []User       `json:"users"`
 	InviteCodes []InviteCode `json:"inviteCodes"`
 	Sources     []Source     `json:"sources"`
+	RuleSources []RuleSource `json:"ruleSources"`
+	RuleSets    []RuleSet    `json:"ruleSets"`
 	Outputs     []Output     `json:"outputs"`
 	Updated     time.Time    `json:"updated"`
 }
@@ -202,6 +300,7 @@ type Preview struct {
 	FailedSources     []SourceView   `json:"failedSources"`
 	RegionCounts      map[string]int `json:"regionCounts"`
 	Groups            []GroupPreview `json:"groups"`
+	SourceGroups      []GroupPreview `json:"sourceGroups"`
 	Nodes             []NodePreview  `json:"nodes"`
 	ExcludedNodes     []NodePreview  `json:"excludedNodes"`
 	GeneratedAt       time.Time      `json:"generatedAt"`
@@ -217,12 +316,15 @@ type NodePreview struct {
 	Key            string `json:"key"`
 	Name           string `json:"name"`
 	OriginalName   string `json:"originalName"`
+	SourceID       string `json:"sourceId"`
+	Source         string `json:"source"`
 	Server         string `json:"server"`
 	Port           int    `json:"port"`
 	Region         string `json:"region"`
 	RegionCode     string `json:"regionCode"`
 	ResolvedIP     string `json:"resolvedIp"`
 	ExitIP         string `json:"exitIp"`
+	DelayMS        int    `json:"delayMs"`
 	Alive          *bool  `json:"alive"`
 	ExcludedReason string `json:"excludedReason"`
 	RegionSource   string `json:"regionSource"`

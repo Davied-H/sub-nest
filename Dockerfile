@@ -39,6 +39,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=go-builder /out/subagg /usr/local/bin/subagg
 COPY --from=web-builder /src/web/dist ./web/dist
+COPY rules ./rules
 ENV SUBAGG_ADDR=:8080 \
     SUBAGG_DATA=/data/config.json \
     SUBAGG_STATIC=/app/web/dist

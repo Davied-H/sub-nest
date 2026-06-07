@@ -1,19 +1,23 @@
-import { Fragment, useCallback, useEffect, useMemo, useState } from "react"
+import { Fragment, useCallback, useEffect, useMemo, useState, type ComponentProps, type FormEvent } from "react"
 import {
   ActivityIcon,
   ArchiveRestoreIcon,
+  BugIcon,
   CheckCircle2Icon,
   ClipboardIcon,
   DatabaseBackupIcon,
   DownloadIcon,
   EyeIcon,
+  EyeOffIcon,
   FileJsonIcon,
+  FileTextIcon,
   KeyRoundIcon,
   Loader2Icon,
   LockIcon,
   PauseCircleIcon,
   PlusIcon,
   RefreshCcwIcon,
+  SearchIcon,
   SaveIcon,
   ServerIcon,
   UserIcon,
@@ -36,6 +40,14 @@ import {
   CardTitle,
 } from "@/components/ui/card"
 import { Checkbox } from "@/components/ui/checkbox"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog"
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -89,6 +101,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
 import { Toaster } from "@/components/ui/sonner"
 import { TooltipProvider } from "@/components/ui/tooltip"
+import { cn } from "@/lib/utils"
 
 type Dashboard = {
   sourceCount: number
@@ -134,12 +147,15 @@ type Source = {
     key: string
     name: string
     originalName: string
+    sourceId: string
+    source: string
     server: string
     port: number
     region: string
     regionCode: string
     resolvedIp: string
     exitIp: string
+    delayMs: number
     alive?: boolean
     excludedReason: string
     regionSource: string
@@ -173,6 +189,25 @@ type TrafficInfo = {
   lastCheckedAt?: string
   lastStatus: string
   lastError: string
+  debug?: TrafficDebug
+}
+
+type TrafficDebug = {
+  method?: string
+  url?: string
+  status?: string
+  statusCode?: number
+  contentType?: string
+  parserType?: string
+  bodyPreview?: string
+  header?: string
+  paths?: Array<{
+    label: string
+    path: string
+    found: boolean
+    value?: string
+    error?: string
+  }>
 }
 
 type Output = {
@@ -189,10 +224,73 @@ type Output = {
   }
   renameRules: Array<{ pattern: string; replacement: string }>
   nodeNameOverrides?: Record<string, string>
+  pac: {
+    enabled: boolean
+    enabledSet?: boolean
+    proxy: string
+    ruleSetId?: string
+    ruleSourceUrl: string
+    ruleSourceFormat: string
+    ruleRefreshHours: number
+    domainKeywords?: string[]
+    directDomainSuffixes: string[]
+    directCidrs: string[]
+    cachedDomainSuffixes?: string[]
+    lastSyncedAt?: string
+    lastSyncStatus?: string
+    lastSyncError?: string
+  }
   groupMode: string
   lastGeneratedAt?: string
   lastNodeCount: number
   lastDroppedCount: number
+  nodeNames?: string[]
+}
+
+type RuleSource = {
+  id: string
+  name: string
+  url: string
+  format: string
+  refreshHours: number
+  localPath?: string
+  cachedDomainSuffixes?: string[]
+  cachedDomainCount?: number
+  lastSyncedAt?: string
+  lastSyncStatus?: string
+  lastSyncError?: string
+}
+
+type RuleSet = {
+  id: string
+  name: string
+  sourceIds: string[]
+  domainKeywords?: string[]
+  directDomainSuffixes: string[]
+  excludedDomainSuffixes?: string[]
+  directCidrs: string[]
+  cachedDomainSuffixes?: string[]
+  cachedDomainCount?: number
+  lastSyncedAt?: string
+  lastSyncStatus?: string
+  lastSyncError?: string
+}
+
+type RuleDomain = {
+  domain: string
+  source: string
+  type: "cache" | "manual" | "keyword" | "excluded" | string
+}
+
+type RuleDomainsView = {
+  ruleSetId: string
+  ruleSetName: string
+  query: string
+  total: number
+  matched: number
+  limit: number
+  truncated: boolean
+  domains: RuleDomain[]
 }
 
 type Preview = {
@@ -204,16 +302,20 @@ type Preview = {
   unavailableCount: number
   regionCounts: Record<string, number>
   groups: Array<{ name: string; nodes: string[] }>
+  sourceGroups: Array<{ name: string; nodes: string[] }>
   nodes: Array<{
     key: string
     name: string
     originalName: string
+    sourceId: string
+    source: string
     server: string
     port: number
     region: string
     regionCode: string
     resolvedIp: string
     exitIp: string
+    delayMs: number
     alive?: boolean
     excludedReason: string
     regionSource: string
@@ -233,6 +335,8 @@ type Health = {
 type Settings = {
   publicBaseUrl: string
   hasUserToken: boolean
+  refreshMinutes: number
+  trafficQueryMinutes: number
 }
 
 type User = {
@@ -291,6 +395,43 @@ const defaultSource: Source = {
   nodes: [],
 }
 
+const trafficTemplates = [
+  {
+    id: "subscription-userinfo",
+    label: "订阅自带流量",
+    description: "从订阅链接响应头 Subscription-Userinfo 读取 upload、download、total、expire。",
+    query: {
+      mode: "subscription-header" as const,
+      method: "GET",
+      parser: {
+        type: "subscription-header" as const,
+        total: "",
+        download: "",
+        remaining: "",
+        upload: "",
+        expire: "",
+      },
+    },
+  },
+  {
+    id: "just-my-socks",
+    label: "Just My Socks",
+    description: "解析 monthly_bw_limit_b 与 bw_counter_b，自动计算剩余流量。",
+    query: {
+      mode: "custom-http" as const,
+      method: "GET",
+      parser: {
+        type: "json-path" as const,
+        total: "$.monthly_bw_limit_b",
+        download: "$.bw_counter_b",
+        remaining: "",
+        upload: "",
+        expire: "",
+      },
+    },
+  },
+]
+
 const defaultOutput: Output = {
   id: "",
   slug: "main",
@@ -305,9 +446,23 @@ const defaultOutput: Output = {
   },
   renameRules: [],
   nodeNameOverrides: {},
+  pac: {
+    enabled: true,
+    enabledSet: true,
+    proxy: "PROXY 127.0.0.1:7890; SOCKS5 127.0.0.1:7890; DIRECT",
+    ruleSetId: "china-direct",
+    ruleSourceUrl: "https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/ChinaDomain.list",
+    ruleSourceFormat: "clash-domain",
+    ruleRefreshHours: 24,
+    domainKeywords: [],
+    directDomainSuffixes: [],
+    directCidrs: [],
+    cachedDomainSuffixes: [],
+  },
   groupMode: "region",
   lastNodeCount: 0,
   lastDroppedCount: 0,
+  nodeNames: [],
 }
 
 const downloadFormatItems = [
@@ -321,6 +476,27 @@ const outputFormatItems = [
   { label: "Base64 分享链接", value: "base64" },
 ]
 
+const defaultRuleSource: RuleSource = {
+  id: "acl4ssr-china-domain",
+  name: "ACL4SSR 国内域名",
+  url: "https://cdn.jsdelivr.net/gh/ACL4SSR/ACL4SSR@master/Clash/ChinaDomain.list",
+  format: "clash-domain",
+  refreshHours: 24,
+  localPath: "rules/pac/acl4ssr-china-domain.list",
+  cachedDomainSuffixes: [],
+}
+
+const defaultRuleSet: RuleSet = {
+  id: "china-direct",
+  name: "国内直连",
+  sourceIds: ["acl4ssr-china-domain", "blackmatrix7-china", "loyalsoldier-direct"],
+  domainKeywords: [],
+  directDomainSuffixes: [],
+  excludedDomainSuffixes: [],
+  directCidrs: [],
+  cachedDomainSuffixes: [],
+}
+
 function App() {
   const [health, setHealth] = useState<Health | null>(null)
   const [token, setToken] = useState(() => localStorage.getItem("sub-nest-token") ?? localStorage.getItem("subagg-token") ?? "")
@@ -329,6 +505,8 @@ function App() {
   const [targetUserId, setTargetUserId] = useState(() => localStorage.getItem("sub-nest-target-user") ?? "")
   const [dashboard, setDashboard] = useState<Dashboard | null>(null)
   const [sources, setSources] = useState<Source[]>([])
+  const [ruleSources, setRuleSources] = useState<RuleSource[]>([])
+  const [ruleSets, setRuleSets] = useState<RuleSet[]>([])
   const [outputs, setOutputs] = useState<Output[]>([])
   const [preview, setPreview] = useState<Preview | null>(null)
   const [settings, setSettings] = useState<Settings | null>(null)
@@ -353,11 +531,13 @@ function App() {
       setLoading(true)
     }
     try {
-      const [nextUserResponse, nextUsers, nextDashboard, nextSources, nextOutputs, nextSettings] = await Promise.all([
+      const [nextUserResponse, nextUsers, nextDashboard, nextSources, nextRuleSources, nextRuleSets, nextOutputs, nextSettings] = await Promise.all([
         api.get<{ user: User }>("/api/me"),
         user?.role === "admin" ? api.get<User[]>("/api/admin/users") : Promise.resolve([]),
         api.get<Dashboard>(withScope("/api/dashboard", scopeQuery)),
         api.get<Source[]>(withScope("/api/sources?includeUrl=1", scopeQuery)),
+        api.get<RuleSource[]>(withScope("/api/rule-sources", scopeQuery)),
+        api.get<RuleSet[]>(withScope("/api/rule-sets", scopeQuery)),
         api.get<Output[]>(withScope("/api/outputs", scopeQuery)),
         api.get<Settings>("/api/settings"),
       ])
@@ -377,6 +557,8 @@ function App() {
       }
       setDashboard(nextDashboard)
       setSources(nextSources)
+      setRuleSources(nextRuleSources)
+      setRuleSets(nextRuleSets)
       setOutputs(nextOutputs)
       setSettings(nextSettings)
       if (!nextSettings.hasUserToken && userToken) {
@@ -547,6 +729,7 @@ function App() {
               <TabsList className="w-full justify-start overflow-x-auto lg:w-fit">
                 <TabsTrigger value="overview">首页</TabsTrigger>
                 <TabsTrigger value="sources">订阅源</TabsTrigger>
+                <TabsTrigger value="rules">规则</TabsTrigger>
                 <TabsTrigger value="outputs">公开订阅</TabsTrigger>
                 <TabsTrigger value="preview">预览</TabsTrigger>
                 {user?.role === "admin" ? <TabsTrigger value="users">用户</TabsTrigger> : null}
@@ -605,11 +788,22 @@ function App() {
                 api={api}
                 outputs={outputs}
                 sources={sources}
+                ruleSets={ruleSets}
                 loading={loading}
                 scopeQuery={scopeQuery}
                 reload={loadProtected}
                 publicExampleUrl={dashboard?.publicExampleUrl}
                 userToken={userToken}
+              />
+            </TabsContent>
+            <TabsContent value="rules">
+              <RulesView
+                api={api}
+                ruleSources={ruleSources}
+                ruleSets={ruleSets}
+                outputs={outputs}
+                scopeQuery={scopeQuery}
+                reload={loadProtected}
               />
             </TabsContent>
             <TabsContent value="preview">
@@ -679,10 +873,24 @@ function AuthScreen({
   const [name, setName] = useState("")
   const [publicBaseURL, setPublicBaseURL] = useState(window.location.origin)
   const registering = !setup && mode === "register"
+  const canSubmitAuth = !busy && rawToken.length >= 8 && (!registering || (inviteCode.trim() && userSlug.trim()))
+
+  function submitAuth(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!canSubmitAuth) {
+      return
+    }
+    if (registering) {
+      onRegister({ inviteCode, userSlug, name, token: rawToken })
+      return
+    }
+    onSubmit(rawToken, setup, publicBaseURL)
+  }
 
   return (
     <main className="flex min-h-screen items-center justify-center bg-background p-4">
       <Card className="w-full max-w-md">
+        <form onSubmit={submitAuth}>
         <CardHeader>
           <div className="flex size-10 items-center justify-center rounded-lg border bg-muted">
             {registering ? <KeyRoundIcon /> : <LockIcon />}
@@ -696,8 +904,8 @@ function AuthScreen({
           <FieldGroup>
             {!setup ? (
               <div className="grid grid-cols-2 gap-2">
-                <Button variant={!registering ? "default" : "outline"} onClick={() => setMode("login")}>登录</Button>
-                <Button variant={registering ? "default" : "outline"} onClick={() => setMode("register")}>注册</Button>
+                <Button type="button" variant={!registering ? "default" : "outline"} onClick={() => setMode("login")}>登录</Button>
+                <Button type="button" variant={registering ? "default" : "outline"} onClick={() => setMode("register")}>注册</Button>
               </div>
             ) : null}
             {registering ? (
@@ -719,9 +927,8 @@ function AuthScreen({
             ) : null}
             <Field>
               <FieldLabel htmlFor="admin-token">{registering ? "个人 token" : "管理 token"}</FieldLabel>
-              <Input
+              <PasswordInput
                 id="admin-token"
-                type="password"
                 value={rawToken}
                 onChange={(event) => setRawToken(event.target.value)}
                 placeholder="至少 8 位"
@@ -742,22 +949,40 @@ function AuthScreen({
         </CardContent>
         <CardFooter>
           <Button
+            type="submit"
             className="w-full"
-            disabled={busy || rawToken.length < 8 || (registering && (!inviteCode.trim() || !userSlug.trim()))}
-            onClick={() => {
-              if (registering) {
-                onRegister({ inviteCode, userSlug, name, token: rawToken })
-                return
-              }
-              onSubmit(rawToken, setup, publicBaseURL)
-            }}
+            disabled={!canSubmitAuth}
           >
             {busy ? <Loader2Icon data-icon="inline-start" /> : <ShieldIcon data-icon="inline-start" />}
             {setup ? "完成初始化" : registering ? "创建账号" : "进入后台"}
           </Button>
         </CardFooter>
+        </form>
       </Card>
     </main>
+  )
+}
+
+function PasswordInput(props: ComponentProps<typeof Input>) {
+  const [visible, setVisible] = useState(false)
+  return (
+    <div className="relative">
+      <Input
+        {...props}
+        type={visible ? "text" : "password"}
+        className={cn("pr-10", props.className)}
+      />
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon"
+        className="absolute right-1 top-1/2 size-8 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+        onClick={() => setVisible((value) => !value)}
+        aria-label={visible ? "隐藏输入内容" : "显示输入内容"}
+      >
+        {visible ? <EyeOffIcon /> : <EyeIcon />}
+      </Button>
+    </div>
   )
 }
 
@@ -810,22 +1035,32 @@ function Overview({
           ) : (
             outputs.map((output) => {
               const url = subscriptionURL(publicExampleUrl, output.slug, userToken)
+              const pacUrl = pacURL(url)
               return (
                 <div key={output.id} className="flex flex-col gap-2 rounded-lg border p-3 sm:flex-row sm:items-center sm:justify-between">
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2">
-                    <p className="truncate font-medium">{output.name}</p>
-                    <StatusBadge status={output.enabled ? "ok" : "paused"} />
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <p className="truncate font-medium">{output.name}</p>
+                      <StatusBadge status={output.enabled ? "ok" : "paused"} />
+                    </div>
+                    <p className="truncate text-sm text-muted-foreground">
+                      {url}
+                    </p>
+                    <p className="truncate text-xs text-muted-foreground">
+                      PAC {pacUrl}
+                    </p>
                   </div>
-                  <p className="truncate text-sm text-muted-foreground">
-                    {url}
-                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    <Button variant="outline" size="sm" onClick={() => copyText(url, "订阅地址已复制")}>
+                      <ClipboardIcon data-icon="inline-start" />
+                      订阅
+                    </Button>
+                    <Button variant="outline" size="sm" onClick={() => copyText(pacUrl, "PAC 地址已复制")}>
+                      <FileTextIcon data-icon="inline-start" />
+                      PAC
+                    </Button>
+                  </div>
                 </div>
-                <Button variant="outline" size="sm" onClick={() => copyText(url, "订阅地址已复制")}>
-                  <ClipboardIcon data-icon="inline-start" />
-                  复制
-                </Button>
-              </div>
               )
             })
           )}
@@ -857,13 +1092,11 @@ function SourcesView({
 
   function openSourceSheet(source: Source) {
     setEditing(source)
-    toast.message(source.id ? `正在编辑「${source.name}」` : "正在添加订阅源")
   }
 
   function toggleSourceNodes(source: Source) {
     const nextExpanded = !expanded[source.id]
     setExpanded({ ...expanded, [source.id]: nextExpanded })
-    toast.message(nextExpanded ? `已展开「${source.name}」节点` : `已收起「${source.name}」节点`)
   }
 
   async function refreshSource(source: Source) {
@@ -943,7 +1176,7 @@ function SourcesView({
                   <TableHead>节点</TableHead>
                   <TableHead>流量</TableHead>
                   <TableHead>订阅链接</TableHead>
-                  <TableHead className="text-right">操作</TableHead>
+                  <TableHead className="sticky right-0 z-10 min-w-52 bg-background text-right shadow-[-12px_0_16px_-16px_rgba(0,0,0,0.35)]">操作</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -996,7 +1229,7 @@ function SourcesView({
                       <TrafficSummary source={source} />
                     </TableCell>
                     <TableCell className="max-w-64 truncate text-muted-foreground">{source.urlMasked}</TableCell>
-                    <TableCell>
+                    <TableCell className="sticky right-0 z-10 min-w-52 bg-background shadow-[-12px_0_16px_-16px_rgba(0,0,0,0.35)]">
                       <div className="flex justify-end gap-2">
                         <Button variant="outline" size="sm" onClick={() => refreshSource(source)} disabled={busy === `refresh:${source.id}` || source.lastStatus === "refreshing"}>
                           {busy === `refresh:${source.id}` || source.lastStatus === "refreshing" ? <Loader2Icon data-icon="inline-start" /> : <RefreshCcwIcon data-icon="inline-start" />}
@@ -1073,6 +1306,7 @@ function SourceNodesTable({ nodes }: { nodes: NonNullable<Source["nodes"]> }) {
               <TableHead>原始节点</TableHead>
               <TableHead>地址</TableHead>
               <TableHead>地区</TableHead>
+              <TableHead>延迟</TableHead>
               <TableHead>状态</TableHead>
               <TableHead>出口 / 解析 IP</TableHead>
               <TableHead>失败原因</TableHead>
@@ -1088,6 +1322,7 @@ function SourceNodesTable({ nodes }: { nodes: NonNullable<Source["nodes"]> }) {
                     {node.regionCode || "OTHER"}
                   </Badge>
                 </TableCell>
+                <TableCell className="font-mono text-muted-foreground tabular-nums">{formatDelay(node.delayMs)}</TableCell>
                 <TableCell>
                   <Badge variant={node.alive === false ? "destructive" : node.alive === true ? "secondary" : "outline"}>
                     {node.alive === false ? "不可用" : node.alive === true ? "可用" : "未检测"}
@@ -1160,6 +1395,7 @@ function SourceSheet({
 }) {
   const [draft, setDraft] = useState<Source>(defaultSource)
   const [trafficBusy, setTrafficBusy] = useState(false)
+  const [trafficTemplateID, setTrafficTemplateID] = useState("")
   const open = Boolean(source)
   const sourceType = draft.sourceType ?? "url"
   const trafficQuery = draft.trafficQuery ?? defaultSource.trafficQuery
@@ -1167,6 +1403,7 @@ function SourceSheet({
 
   useEffect(() => {
     setDraft(source ?? defaultSource)
+    setTrafficTemplateID("")
   }, [source])
 
   async function loadSourceFile(file?: File) {
@@ -1219,21 +1456,48 @@ function SourceSheet({
     updateTrafficQuery({ headers })
   }
 
-  async function testTrafficQuery() {
-    if (!draft.id) {
-      toast.error("请先保存订阅源后再测试流量查询")
+  function applyTrafficTemplate(templateID: string) {
+    const template = trafficTemplates.find((item) => item.id === templateID)
+    if (!template) {
       return
     }
+    setTrafficTemplateID(templateID)
+    setDraft((current) => {
+      const currentQuery = current.trafficQuery ?? defaultSource.trafficQuery
+      return {
+        ...current,
+        trafficQuery: {
+          ...currentQuery,
+          ...template.query,
+          url: currentQuery.url,
+          headers: currentQuery.headers,
+          body: currentQuery.body,
+          parser: {
+            ...(template.query.parser ?? {}),
+          },
+        },
+      }
+    })
+  }
+
+  async function testTrafficQuery() {
     setTrafficBusy(true)
     try {
-      const updated = await api.post<Source>(withScope(`/api/sources/${draft.id}/traffic-query`, scopeQuery), {})
-      setDraft(updated)
+      const updated = draft.id
+        ? await api.post<Source>(withScope(`/api/sources/${draft.id}/traffic-query`, scopeQuery), { source: draft })
+        : { trafficInfo: await api.post<TrafficInfo>(withScope("/api/traffic-query/test", scopeQuery), { source: draft }) }
+      setDraft((current) => ({
+        ...current,
+        trafficInfo: updated.trafficInfo,
+      }))
       if (updated.trafficInfo?.lastStatus === "error") {
         toast.error(updated.trafficInfo.lastError || "流量查询失败")
       } else {
         toast.success("流量查询完成")
       }
-      await reload({ silent: true })
+      if (draft.id) {
+        await reload({ silent: true })
+      }
     } catch (error) {
       toast.error(messageOf(error))
     } finally {
@@ -1331,6 +1595,24 @@ function SourceSheet({
               </Select>
               <FieldDescription>刷新订阅源时会同步更新流量；查询失败不会影响节点缓存。</FieldDescription>
             </Field>
+            <Field>
+              <FieldLabel>流量模板</FieldLabel>
+              <Select value={trafficTemplateID} onValueChange={(value) => applyTrafficTemplate(String(value))}>
+                <SelectTrigger>
+                  <SelectValue placeholder="选择模板" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectGroup>
+                    {trafficTemplates.map((template) => (
+                      <SelectItem key={template.id} value={template.id}>{template.label}</SelectItem>
+                    ))}
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+              <FieldDescription>
+                选择模板会自动填充查询方式和解析字段，不会覆盖已输入的 URL、请求头或请求体。
+              </FieldDescription>
+            </Field>
             {trafficQuery.mode === "custom-http" ? (
               <>
                 <Field>
@@ -1413,6 +1695,7 @@ function SourceSheet({
                 <AlertDescription className="flex flex-col gap-1">
                   <span>{trafficInfoText(draft.trafficInfo)}</span>
                   {draft.trafficInfo?.lastError ? <span className="text-destructive">{draft.trafficInfo.lastError}</span> : null}
+                  <TrafficDebugPanel info={draft.trafficInfo} />
                 </AlertDescription>
               </Alert>
             ) : null}
@@ -1420,7 +1703,7 @@ function SourceSheet({
         </div>
         <SheetFooter className="flex flex-wrap gap-2">
           {trafficQuery.mode !== "disabled" ? (
-            <Button type="button" variant="outline" disabled={trafficBusy || !draft.id} onClick={testTrafficQuery}>
+            <Button type="button" variant="outline" disabled={trafficBusy || !sourceInputReady(draft)} onClick={testTrafficQuery}>
               {trafficBusy ? <Loader2Icon data-icon="inline-start" /> : <RefreshCcwIcon data-icon="inline-start" />}
               测试流量查询
             </Button>
@@ -1439,6 +1722,7 @@ function OutputsView({
   api,
   outputs,
   sources,
+  ruleSets,
   loading,
   scopeQuery,
   reload,
@@ -1448,6 +1732,7 @@ function OutputsView({
   api: API
   outputs: Output[]
   sources: Source[]
+  ruleSets: RuleSet[]
   loading: boolean
   scopeQuery: string
   reload: () => Promise<void>
@@ -1455,11 +1740,10 @@ function OutputsView({
   userToken: string
 }) {
   const [editing, setEditing] = useState<Output | null>(null)
-  const preparedDefault = { ...defaultOutput, sourceIds: sources.map((source) => source.id) }
+  const preparedDefault = { ...defaultOutput, sourceIds: sources.map((source) => source.id), pac: { ...defaultOutput.pac, ruleSetId: ruleSets[0]?.id ?? defaultOutput.pac.ruleSetId } }
 
   function openOutputSheet(output: Output) {
     setEditing(output)
-    toast.message(output.id ? `正在编辑「${output.name}」` : "正在创建公开订阅")
   }
 
   async function deleteOutput(output: Output) {
@@ -1502,6 +1786,7 @@ function OutputsView({
           <div className="grid gap-3 lg:grid-cols-2">
             {outputs.map((output) => {
               const url = subscriptionURL(publicExampleUrl, output.slug, userToken)
+              const pacUrl = pacURL(url)
               return (
                 <Card key={output.id}>
                   <CardHeader>
@@ -1509,6 +1794,7 @@ function OutputsView({
                       <div className="min-w-0">
                         <CardTitle className="truncate">{output.name}</CardTitle>
                         <CardDescription className="truncate">{url}</CardDescription>
+                        <CardDescription className="truncate text-xs">PAC {pacUrl}</CardDescription>
                       </div>
                       <StatusBadge status={output.enabled ? "ok" : "paused"} />
                     </div>
@@ -1519,10 +1805,15 @@ function OutputsView({
                       <Metric label="输入源" value={output.sourceIds.length} />
                       <Metric label="节点" value={output.lastNodeCount || "-"} />
                     </div>
+                    <OutputNodeNames names={output.nodeNames ?? []} />
                     <div className="flex flex-wrap gap-2">
                       <Button variant="outline" size="sm" onClick={() => copyText(url, "公开订阅地址已复制")}>
                         <ClipboardIcon data-icon="inline-start" />
                         复制订阅链接
+                      </Button>
+                      <Button variant="outline" size="sm" onClick={() => copyText(pacUrl, "PAC 地址已复制")}>
+                        <FileTextIcon data-icon="inline-start" />
+                        复制 PAC
                       </Button>
                       <DropdownMenu>
                         <DropdownMenuTrigger render={<Button variant="outline" size="sm" />}>
@@ -1540,6 +1831,10 @@ function OutputsView({
                                 {item.label}
                               </DropdownMenuItem>
                             ))}
+                            <DropdownMenuItem onClick={() => downloadPAC(pacUrl, output.slug)}>
+                              <FileTextIcon />
+                              PAC 文件
+                            </DropdownMenuItem>
                           </DropdownMenuGroup>
                         </DropdownMenuContent>
                       </DropdownMenu>
@@ -1558,6 +1853,7 @@ function OutputsView({
       <OutputSheet
         output={editing}
         sources={sources}
+        ruleSets={ruleSets}
         onOpenChange={(open) => !open && setEditing(null)}
         onSave={async (output) => {
           try {
@@ -1581,11 +1877,13 @@ function OutputsView({
 function OutputSheet({
   output,
   sources,
+  ruleSets,
   onOpenChange,
   onSave,
 }: {
   output: Output | null
   sources: Source[]
+  ruleSets: RuleSet[]
   onOpenChange: (open: boolean) => void
   onSave: (output: Output) => Promise<void>
 }) {
@@ -1593,7 +1891,7 @@ function OutputSheet({
   const open = Boolean(output)
 
   useEffect(() => {
-    setDraft(output ?? defaultOutput)
+    setDraft(normalizeOutputDraft(output ?? defaultOutput))
   }, [output])
 
   return (
@@ -1633,6 +1931,14 @@ function OutputSheet({
                 </SelectContent>
               </Select>
             </Field>
+            {draft.format !== "base64" ? (
+              <Field>
+                <FieldLabel>节点分组</FieldLabel>
+                <div className="rounded-lg border bg-muted/30 p-3 text-sm text-muted-foreground">
+                  输出会同时生成地区组和原始订阅来源组；客户端可在“节点选择”中按地区或来源切换。
+                </div>
+              </Field>
+            ) : null}
             <Field>
               <FieldLabel>输入订阅源</FieldLabel>
               <div className="flex flex-col gap-2 rounded-lg border p-3">
@@ -1680,6 +1986,55 @@ function OutputSheet({
                 onChange={(event) => setDraft({ ...draft, renameRules: parseRenameRules(event.target.value) })}
                 placeholder="香港 IEPL (\\d+) => [JMS] 香港 $1"
               />
+            </Field>
+            <Field>
+              <FieldLabel>PAC 与直连方案</FieldLabel>
+              <div className="grid gap-3 rounded-lg border p-3">
+                <Field orientation="horizontal">
+                  <div>
+                    <FieldLabel>启用 PAC</FieldLabel>
+                    <FieldDescription>关闭后 PAC 仍可访问，但只返回 DIRECT。</FieldDescription>
+                  </div>
+                  <Switch
+                    checked={draft.pac.enabled}
+                    onCheckedChange={(checked) => setDraft({ ...draft, pac: { ...draft.pac, enabled: checked, enabledSet: true } })}
+                  />
+                </Field>
+                <Field>
+                  <FieldLabel htmlFor="pac-proxy">代理返回值</FieldLabel>
+                  <Input
+                    id="pac-proxy"
+                    value={draft.pac.proxy}
+                    onChange={(event) => setDraft({ ...draft, pac: { ...draft.pac, proxy: event.target.value } })}
+                    placeholder="PROXY 127.0.0.1:7890; SOCKS5 127.0.0.1:7890; DIRECT"
+                  />
+                  <FieldDescription>命中直连规则外的流量会返回这个值。</FieldDescription>
+                </Field>
+                <Field>
+                  <FieldLabel>直连方案</FieldLabel>
+                  <Select
+                    value={draft.pac.ruleSetId || ruleSets[0]?.id || "china-direct"}
+                    onValueChange={(value) => setDraft({ ...draft, pac: { ...draft.pac, ruleSetId: String(value) } })}
+                  >
+                    <SelectTrigger className="w-full">
+                      <SelectValue placeholder="选择直连方案" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectGroup>
+                        {(ruleSets.length ? ruleSets : [defaultRuleSet]).map((set) => (
+                          <SelectItem key={set.id} value={set.id}>{set.name}</SelectItem>
+                        ))}
+                      </SelectGroup>
+                    </SelectContent>
+                  </Select>
+                  <FieldDescription>每个公开订阅只选择一个方案；社区规则和手工直连名单在“规则”页维护。</FieldDescription>
+                </Field>
+                <div className="rounded-md bg-muted/35 p-2 text-xs text-muted-foreground">
+                  方案缓存 {cachedDomainCount(ruleSets.find((set) => set.id === draft.pac.ruleSetId)) || cachedDomainCount(draft.pac)} 条
+                  {ruleSets.find((set) => set.id === draft.pac.ruleSetId)?.lastSyncedAt ? `，最近同步 ${formatTime(ruleSets.find((set) => set.id === draft.pac.ruleSetId)?.lastSyncedAt)}` : ""}
+                  {ruleSets.find((set) => set.id === draft.pac.ruleSetId)?.lastSyncStatus === "error" && ruleSets.find((set) => set.id === draft.pac.ruleSetId)?.lastSyncError ? `，失败：${ruleSets.find((set) => set.id === draft.pac.ruleSetId)?.lastSyncError}` : ""}
+                </div>
+              </div>
             </Field>
             <Field orientation="horizontal">
               <div>
@@ -1825,17 +2180,19 @@ function PreviewView({
               <Separator />
               <div className="grid gap-3 lg:grid-cols-2">
                 {preview.groups.map((group) => (
-                  <Card key={group.name}>
-                    <CardHeader className="pb-2">
+                  <Card key={`region-${group.name}`}>
+                    <CardHeader>
                       <CardTitle className="text-base">{group.name}</CardTitle>
                       <CardDescription>{group.nodes.length} 个节点</CardDescription>
                     </CardHeader>
-                    <CardContent>
-                      <div className="flex max-h-40 flex-col gap-1 overflow-y-auto text-sm text-muted-foreground">
-                        {group.nodes.slice(0, 40).map((node) => <span key={node} className="truncate">{node}</span>)}
-                        {group.nodes.length > 40 ? <span>还有 {group.nodes.length - 40} 个...</span> : null}
-                      </div>
-                    </CardContent>
+                  </Card>
+                ))}
+                {(preview.sourceGroups ?? []).map((group) => (
+                  <Card key={`source-${group.name}`}>
+                    <CardHeader>
+                      <CardTitle className="text-base">{group.name}</CardTitle>
+                      <CardDescription>{group.nodes.length} 个节点</CardDescription>
+                    </CardHeader>
                   </Card>
                 ))}
               </div>
@@ -1861,6 +2218,7 @@ function PreviewView({
                           <TableHead>原始名称</TableHead>
                           <TableHead>地址</TableHead>
                           <TableHead>地区</TableHead>
+                          <TableHead>延迟</TableHead>
                           <TableHead>可用性</TableHead>
                           <TableHead>出口 / 解析 IP</TableHead>
                           <TableHead>来源</TableHead>
@@ -1882,6 +2240,7 @@ function PreviewView({
                                 {node.regionCode || "OTHER"}
                               </Badge>
                             </TableCell>
+                            <TableCell className="font-mono text-muted-foreground tabular-nums">{formatDelay(node.delayMs)}</TableCell>
                             <TableCell>
                               <Badge variant={node.alive === false ? "destructive" : node.alive === true ? "secondary" : "outline"}>
                                 {node.alive === false ? "不可用" : node.alive === true ? "可用" : "未检测"}
@@ -1889,7 +2248,7 @@ function PreviewView({
                             </TableCell>
                             <TableCell className="text-muted-foreground">{node.exitIp || node.resolvedIp || "-"}</TableCell>
                             <TableCell className="max-w-48 truncate text-muted-foreground">
-                              {node.probeStatus === "ok" ? "真实出口" : `兜底${node.probeError ? `：${node.probeError}` : ""}`}
+                              {node.source || node.sourceId || "-"}
                             </TableCell>
                           </TableRow>
                         ))}
@@ -2041,6 +2400,19 @@ function UsersView({ api, users, reload }: { api: API; users: User[]; reload: ()
     }
   }
 
+  async function deleteInvite(invite: InviteCode) {
+    if (!window.confirm(`确定删除授权码「${invite.label || invite.id}」吗？`)) {
+      return
+    }
+    try {
+      await api.delete(`/api/admin/invite-codes/${invite.id}`)
+      toast.success("授权码已删除")
+      await loadInvites()
+    } catch (error) {
+      toast.error(messageOf(error))
+    }
+  }
+
   async function setUserEnabled(user: User, enabled: boolean) {
     try {
       await api.put(`/api/admin/users/${user.id}`, { enabled })
@@ -2092,17 +2464,24 @@ function UsersView({ api, users, reload }: { api: API; users: User[]; reload: ()
                   <TableHead>状态</TableHead>
                   <TableHead>使用者</TableHead>
                   <TableHead>创建时间</TableHead>
+                  <TableHead className="text-right">操作</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {inviteCodes.length === 0 ? (
-                  <TableRow><TableCell colSpan={4} className="text-muted-foreground">暂无授权码</TableCell></TableRow>
+                  <TableRow><TableCell colSpan={5} className="text-muted-foreground">暂无授权码</TableCell></TableRow>
                 ) : inviteCodes.map((invite) => (
                   <TableRow key={invite.id}>
                     <TableCell className="max-w-40 truncate">{invite.label || "-"}</TableCell>
                     <TableCell><Badge variant={invite.usedAt ? "secondary" : "outline"}>{invite.usedAt ? "已使用" : "未使用"}</Badge></TableCell>
                     <TableCell className="max-w-40 truncate">{userName(invite.usedByUserId)}</TableCell>
                     <TableCell className="text-muted-foreground">{formatTime(invite.createdAt)}</TableCell>
+                    <TableCell className="text-right">
+                      <Button variant="ghost" size="sm" onClick={() => deleteInvite(invite)}>
+                        <Trash2Icon data-icon="inline-start" />
+                        删除
+                      </Button>
+                    </TableCell>
                   </TableRow>
                 ))}
               </TableBody>
@@ -2177,11 +2556,21 @@ function SettingsView({
   const [newAdminToken, setNewAdminToken] = useState("")
   const [confirmAdminToken, setConfirmAdminToken] = useState("")
   const [userTokenDraft, setUserTokenDraft] = useState(userToken)
+  const [refreshMinutesDraft, setRefreshMinutesDraft] = useState(String(settings?.refreshMinutes ?? 60))
+  const [trafficMinutesDraft, setTrafficMinutesDraft] = useState(String(settings?.trafficQueryMinutes ?? 5))
   const [busy, setBusy] = useState("")
 
   useEffect(() => {
     setUserTokenDraft(userToken)
   }, [userToken])
+
+  useEffect(() => {
+    setTrafficMinutesDraft(String(settings?.trafficQueryMinutes ?? 5))
+  }, [settings?.trafficQueryMinutes])
+
+  useEffect(() => {
+    setRefreshMinutesDraft(String(settings?.refreshMinutes ?? 60))
+  }, [settings?.refreshMinutes])
 
   async function updateAdminToken() {
     if (newAdminToken !== confirmAdminToken) {
@@ -2220,9 +2609,49 @@ function SettingsView({
     }
   }
 
+  async function updateTrafficQuerySettings() {
+    const minutes = Number.parseInt(trafficMinutesDraft, 10)
+    if (!Number.isFinite(minutes) || minutes < 1 || minutes > 1440) {
+      toast.error("流量查询间隔需要在 1 到 1440 分钟之间")
+      return
+    }
+    setBusy("traffic-query")
+    try {
+      const nextSettings = await api.put<Settings>("/api/settings/traffic-query", { minutes })
+      onUserTokenUpdated(nextSettings, userTokenDraft.trim())
+      setTrafficMinutesDraft(String(nextSettings.trafficQueryMinutes))
+      toast.success("流量查询设置已保存")
+    } catch (error) {
+      toast.error(messageOf(error))
+    } finally {
+      setBusy("")
+    }
+  }
+
+  async function updateRefreshSettings() {
+    const minutes = Number.parseInt(refreshMinutesDraft, 10)
+    if (!Number.isFinite(minutes) || minutes < 1 || minutes > 1440) {
+      toast.error("自动刷新间隔需要在 1 到 1440 分钟之间")
+      return
+    }
+    setBusy("refresh")
+    try {
+      const nextSettings = await api.put<Settings>("/api/settings/refresh", { minutes })
+      onUserTokenUpdated(nextSettings, userTokenDraft.trim())
+      setRefreshMinutesDraft(String(nextSettings.refreshMinutes))
+      toast.success("自动刷新设置已保存")
+    } catch (error) {
+      toast.error(messageOf(error))
+    } finally {
+      setBusy("")
+    }
+  }
+
   const userTokenEnabled = settings?.hasUserToken ?? false
   const canSaveAdminToken = currentAdminToken.length >= 8 && newAdminToken.length >= 8 && confirmAdminToken.length >= 8
   const canSaveUserToken = userTokenDraft.trim().length >= 8
+  const canSaveRefreshMinutes = Number.parseInt(refreshMinutesDraft, 10) >= 1 && Number.parseInt(refreshMinutesDraft, 10) <= 1440
+  const canSaveTrafficMinutes = Number.parseInt(trafficMinutesDraft, 10) >= 1 && Number.parseInt(trafficMinutesDraft, 10) <= 1440
 
   return (
     <div className="grid gap-4 lg:grid-cols-2">
@@ -2240,9 +2669,8 @@ function SettingsView({
           <FieldGroup>
             <Field>
               <FieldLabel htmlFor="current-admin-token">当前管理员 token</FieldLabel>
-              <Input
+              <PasswordInput
                 id="current-admin-token"
-                type="password"
                 value={currentAdminToken}
                 onChange={(event) => setCurrentAdminToken(event.target.value)}
                 placeholder="输入当前 token"
@@ -2250,9 +2678,8 @@ function SettingsView({
             </Field>
             <Field>
               <FieldLabel htmlFor="new-admin-token">新管理员 token</FieldLabel>
-              <Input
+              <PasswordInput
                 id="new-admin-token"
-                type="password"
                 value={newAdminToken}
                 onChange={(event) => setNewAdminToken(event.target.value)}
                 placeholder="至少 8 位"
@@ -2260,9 +2687,8 @@ function SettingsView({
             </Field>
             <Field>
               <FieldLabel htmlFor="confirm-admin-token">确认新 token</FieldLabel>
-              <Input
+              <PasswordInput
                 id="confirm-admin-token"
-                type="password"
                 value={confirmAdminToken}
                 onChange={(event) => setConfirmAdminToken(event.target.value)}
                 placeholder="再次输入新 token"
@@ -2295,9 +2721,8 @@ function SettingsView({
           <FieldGroup>
             <Field>
               <FieldLabel htmlFor="user-token">公开订阅用户 token</FieldLabel>
-              <Input
+              <PasswordInput
                 id="user-token"
-                type="password"
                 value={userTokenDraft}
                 onChange={(event) => setUserTokenDraft(event.target.value)}
                 placeholder={userTokenEnabled ? "输入新的用户 token" : "至少 8 位"}
@@ -2322,15 +2747,928 @@ function SettingsView({
           </Button>
         </CardFooter>
       </Card>
+
+      <Card>
+        <CardHeader>
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <CardTitle>订阅源自动刷新</CardTitle>
+              <CardDescription>按固定频率自动执行顶部的“刷新全部”，更新节点缓存。</CardDescription>
+            </div>
+            <Badge variant="secondary">
+              <RefreshCcwIcon />
+              {settings?.refreshMinutes ?? 60} 分钟
+            </Badge>
+          </div>
+        </CardHeader>
+        <CardContent>
+          <FieldGroup>
+            <Field>
+              <FieldLabel htmlFor="refresh-minutes">刷新间隔（分钟）</FieldLabel>
+              <Input
+                id="refresh-minutes"
+                type="number"
+                min={1}
+                max={1440}
+                step={1}
+                value={refreshMinutesDraft}
+                onChange={(event) => setRefreshMinutesDraft(event.target.value)}
+              />
+              <FieldDescription>
+                默认 60 分钟。后台只刷新已启用的订阅源；正在刷新中的源会自动跳过。
+              </FieldDescription>
+            </Field>
+          </FieldGroup>
+        </CardContent>
+        <CardFooter>
+          <Button disabled={busy === "refresh" || !canSaveRefreshMinutes} onClick={updateRefreshSettings}>
+            {busy === "refresh" ? <Loader2Icon data-icon="inline-start" /> : <SaveIcon data-icon="inline-start" />}
+            保存自动刷新设置
+          </Button>
+        </CardFooter>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <CardTitle>流量查询</CardTitle>
+              <CardDescription>独立于节点刷新，定时更新公开订阅响应头里的用量。</CardDescription>
+            </div>
+            <Badge variant="secondary">
+              <DatabaseBackupIcon />
+              {settings?.trafficQueryMinutes ?? 5} 分钟
+            </Badge>
+          </div>
+        </CardHeader>
+        <CardContent>
+          <FieldGroup>
+            <Field>
+              <FieldLabel htmlFor="traffic-query-minutes">查询间隔（分钟）</FieldLabel>
+              <Input
+                id="traffic-query-minutes"
+                type="number"
+                min={1}
+                max={1440}
+                step={1}
+                value={trafficMinutesDraft}
+                onChange={(event) => setTrafficMinutesDraft(event.target.value)}
+              />
+              <FieldDescription>
+                默认 5 分钟。后台只更新流量信息，不刷新节点；公开订阅会立即使用最近一次成功查询结果。
+              </FieldDescription>
+            </Field>
+          </FieldGroup>
+        </CardContent>
+        <CardFooter>
+          <Button disabled={busy === "traffic-query" || !canSaveTrafficMinutes} onClick={updateTrafficQuerySettings}>
+            {busy === "traffic-query" ? <Loader2Icon data-icon="inline-start" /> : <SaveIcon data-icon="inline-start" />}
+            保存流量查询设置
+          </Button>
+        </CardFooter>
+      </Card>
     </div>
   )
 }
 
-function Metric({ label, value }: { label: string; value: string | number }) {
+function RulesView({
+  api,
+  ruleSources,
+  ruleSets,
+  outputs,
+  scopeQuery,
+  reload,
+}: {
+  api: API
+  ruleSources: RuleSource[]
+  ruleSets: RuleSet[]
+  outputs: Output[]
+  scopeQuery: string
+  reload: () => Promise<void>
+}) {
+  const [sourcesDraft, setSourcesDraft] = useState<RuleSource[]>([])
+  const [setsDraft, setSetsDraft] = useState<RuleSet[]>([])
+  const [activeSetId, setActiveSetId] = useState("")
+  const [busy, setBusy] = useState("")
+
+  useEffect(() => {
+    const nextSources = ruleSources.length ? ruleSources : [defaultRuleSource]
+    setSourcesDraft(nextSources.map(normalizeRuleSourceDraft))
+  }, [ruleSources])
+
+  useEffect(() => {
+    const nextSets = ruleSets.length ? ruleSets : [defaultRuleSet]
+    setSetsDraft(nextSets.map(normalizeRuleSetDraft))
+    setActiveSetId((current) => current && nextSets.some((set) => set.id === current) ? current : nextSets[0]?.id ?? "")
+  }, [ruleSets])
+
+  const activeSet = setsDraft.find((set) => set.id === activeSetId) ?? setsDraft[0]
+  const referencedOutputCount = outputs.filter((output) => (output.pac.ruleSetId || defaultOutput.pac.ruleSetId) === activeSet?.id).length
+  const referencedOutputNames = outputs
+    .filter((output) => (output.pac.ruleSetId || defaultOutput.pac.ruleSetId) === activeSet?.id)
+    .map((output) => output.name)
+  const selectedSources = sourcesDraft.filter((source) => activeSet?.sourceIds.includes(source.id))
+  const selectedSourceDomainCount = selectedSources.reduce((total, source) => total + cachedDomainCount(source), 0)
+  const activeCachedDomainCount = cachedDomainCount(activeSet) || selectedSourceDomainCount
+  const keywordRuleCount = activeSet?.domainKeywords?.length ?? 0
+  const manualDomainCount = activeSet?.directDomainSuffixes.length ?? 0
+  const totalCommunityDomainCount = sourcesDraft.reduce((total, source) => total + cachedDomainCount(source), 0)
+  const errorSourceCount = sourcesDraft.filter((source) => source.lastSyncStatus === "error").length
+  const activeSetIsSaved = Boolean(activeSet && ruleSets.some((set) => set.id === activeSet.id))
+
+  function updateSource(index: number, patch: Partial<RuleSource>) {
+    const current = sourcesDraft[index]
+    if (!current) {
+      return
+    }
+    const nextSource = normalizeRuleSourceDraft({ ...current, ...patch })
+    setSourcesDraft((items) => items.map((item, itemIndex) => itemIndex === index ? nextSource : item))
+    if (nextSource.id !== current.id) {
+      setSetsDraft((items) => items.map((set) => normalizeRuleSetDraft({
+        ...set,
+        sourceIds: set.sourceIds.map((id) => id === current.id ? nextSource.id : id),
+      })))
+    }
+  }
+
+  function updateActiveSet(patch: Partial<RuleSet>) {
+    if (!activeSet) {
+      return
+    }
+    const nextID = patch.id ? normalizeDraftID(patch.id) : activeSet.id
+    setSetsDraft((items) => items.map((item) => item.id === activeSet.id ? normalizeRuleSetDraft({ ...item, ...patch }) : item))
+    if (nextID !== activeSet.id) {
+      setActiveSetId(nextID)
+    }
+  }
+
+  function addSource() {
+    const id = uniqueDraftID("rule-source", sourcesDraft.map((source) => source.id))
+    const nextSource = normalizeRuleSourceDraft({
+      ...defaultRuleSource,
+      id,
+      name: "新规则源",
+      url: "",
+      localPath: "",
+      cachedDomainSuffixes: [],
+      cachedDomainCount: 0,
+    })
+    setSourcesDraft([...sourcesDraft, normalizeRuleSourceDraft({
+      ...nextSource,
+    })])
+    if (activeSet) {
+      setSetsDraft((items) => items.map((set) => set.id === activeSet.id ? normalizeRuleSetDraft({
+        ...set,
+        sourceIds: [...set.sourceIds, nextSource.id],
+      }) : set))
+    }
+  }
+
+  function removeSource(id: string) {
+    if (sourcesDraft.length <= 1) {
+      return
+    }
+    const nextSources = sourcesDraft.filter((source) => source.id !== id)
+    setSourcesDraft(nextSources)
+    setSetsDraft((items) => items.map((set) => normalizeRuleSetDraft({
+      ...set,
+      sourceIds: set.sourceIds.filter((sourceId) => sourceId !== id),
+    })))
+  }
+
+  function addSet() {
+    const id = uniqueDraftID("custom-direct", setsDraft.map((set) => set.id))
+    const nextSet = normalizeRuleSetDraft({
+      ...defaultRuleSet,
+      id,
+      name: `自定义方案 ${setsDraft.length + 1}`,
+      sourceIds: sourcesDraft.map((source) => source.id),
+      cachedDomainSuffixes: [],
+      cachedDomainCount: 0,
+    })
+    setSetsDraft([...setsDraft, nextSet])
+    setActiveSetId(nextSet.id)
+  }
+
+  function removeSet(id: string) {
+    if (setsDraft.length <= 1 || referencedOutputCount > 0) {
+      return
+    }
+    const nextSets = setsDraft.filter((set) => set.id !== id)
+    setSetsDraft(nextSets.length ? nextSets : [defaultRuleSet])
+    setActiveSetId(nextSets[0]?.id ?? defaultRuleSet.id)
+  }
+
+  async function saveRules() {
+    const nextSources = sourcesDraft.map(normalizeRuleSourceDraft)
+    const sourceIDs = new Set(nextSources.map((source) => source.id).filter(Boolean))
+    const nextSets = setsDraft
+      .map(normalizeRuleSetDraft)
+      .map((set) => ({ ...set, sourceIds: set.sourceIds.filter((id) => sourceIDs.has(id)) }))
+    if (nextSources.length === 0 || nextSets.length === 0) {
+      toast.error("至少保留一个规则源和一个规则集")
+      return
+    }
+    if (nextSources.some((source) => !source.id || !source.name)) {
+      toast.error("规则源 ID 和名称不能为空")
+      return
+    }
+    if (nextSets.some((set) => !set.id || !set.name)) {
+      toast.error("方案 ID 和名称不能为空")
+      return
+    }
+    if (new Set(nextSources.map((source) => source.id)).size !== nextSources.length) {
+      toast.error("规则源 ID 不能重复")
+      return
+    }
+    if (new Set(nextSets.map((set) => set.id)).size !== nextSets.length) {
+      toast.error("规则集 ID 不能重复")
+      return
+    }
+    setBusy("save")
+    try {
+      await api.put(withScope("/api/rule-sources", scopeQuery), nextSources.map(ruleSourceSavePayload))
+      await api.put(withScope("/api/rule-sets", scopeQuery), nextSets.map(ruleSetSavePayload))
+      toast.success("规则配置已保存")
+      await reload()
+    } catch (error) {
+      toast.error(messageOf(error))
+    } finally {
+      setBusy("")
+    }
+  }
+
+  async function syncActiveSet() {
+    if (!activeSet) {
+      return
+    }
+    if (!activeSetIsSaved) {
+      toast.error("请先保存方案，再同步社区规则")
+      return
+    }
+    setBusy("sync")
+    try {
+      await api.post(withScope(`/api/rule-sets/${activeSet.id}/sync`, scopeQuery), {})
+      toast.success("规则集已同步")
+      await reload()
+    } catch (error) {
+      toast.error(messageOf(error))
+    } finally {
+      setBusy("")
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div>
+          <h2 className="text-lg font-semibold">规则</h2>
+          <p className="text-sm text-muted-foreground">社区规则源独立维护；每个公开订阅只绑定一个直连方案。</p>
+        </div>
+        <Button disabled={busy !== ""} onClick={saveRules}>
+          {busy === "save" ? <Loader2Icon data-icon="inline-start" /> : <SaveIcon data-icon="inline-start" />}
+          保存全部
+        </Button>
+      </div>
+
+      <Card>
+        <CardHeader className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+          <div>
+            <CardTitle>社区规则源</CardTitle>
+            <CardDescription>维护可复用的上游规则列表，方案只引用这些来源。</CardDescription>
+          </div>
+          <Button variant="outline" onClick={addSource}>
+            <PlusIcon data-icon="inline-start" />
+            新增规则源
+          </Button>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid gap-3 md:grid-cols-3">
+            <Metric label="规则源" value={sourcesDraft.length} />
+            <Metric label="缓存域名" value={totalCommunityDomainCount} />
+            <Metric label="异常来源" value={errorSourceCount || "-"} />
+          </div>
+          <div className="grid gap-3 lg:grid-cols-3">
+            {sourcesDraft.map((source, index) => (
+              <div key={`${source.id}-${index}`} className="rounded-md border bg-background p-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="font-medium">{source.name || "未命名规则源"}</span>
+                      <Badge variant={source.lastSyncStatus === "error" ? "destructive" : "secondary"}>
+                        {cachedDomainCount(source)} 条
+                      </Badge>
+                    </div>
+                    <p className="mt-1 break-all text-xs text-muted-foreground">{source.url || source.localPath || "尚未配置来源"}</p>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      {source.lastSyncStatus === "error" ? `同步失败：${source.lastSyncError || "未知错误"}` : `最近同步：${formatTime(source.lastSyncedAt)}`}
+                    </p>
+                  </div>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-sm"
+                    disabled={sourcesDraft.length <= 1}
+                    title="删除规则源"
+                    onClick={() => removeSource(source.id)}
+                  >
+                    <Trash2Icon />
+                  </Button>
+                </div>
+
+                <details className="mt-3 rounded-md bg-muted/25 px-3 py-2">
+                  <summary className="cursor-pointer text-sm font-medium text-muted-foreground">编辑来源</summary>
+                  <div className="mt-3 grid gap-3">
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <Field>
+                        <FieldLabel>显示名称</FieldLabel>
+                        <Input value={source.name} onChange={(event) => updateSource(index, { name: event.target.value })} />
+                      </Field>
+                      <Field>
+                        <FieldLabel>来源 ID</FieldLabel>
+                        <Input value={source.id} onChange={(event) => updateSource(index, { id: event.target.value })} />
+                      </Field>
+                    </div>
+                    <Field>
+                      <FieldLabel>文件格式</FieldLabel>
+                      <Select value={source.format || "domain-list"} onValueChange={(value) => updateSource(index, { format: String(value) })}>
+                        <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                        <SelectContent>
+                          <SelectGroup>
+                            <SelectItem value="clash-domain">Clash DOMAIN</SelectItem>
+                            <SelectItem value="dnsmasq">dnsmasq</SelectItem>
+                            <SelectItem value="domain-list">纯域名列表</SelectItem>
+                            <SelectItem value="yaml-payload">YAML payload</SelectItem>
+                          </SelectGroup>
+                        </SelectContent>
+                      </Select>
+                    </Field>
+                    <Field>
+                      <FieldLabel>刷新间隔（小时）</FieldLabel>
+                      <Input type="number" min={1} value={source.refreshHours} onChange={(event) => updateSource(index, { refreshHours: Number.parseInt(event.target.value, 10) || 24 })} />
+                    </Field>
+                    <Field>
+                      <FieldLabel>在线地址</FieldLabel>
+                      <Input value={source.url} onChange={(event) => updateSource(index, { url: event.target.value })} placeholder="https://example.com/direct.list" />
+                    </Field>
+                    <Field>
+                      <FieldLabel>本地文件</FieldLabel>
+                      <Input value={source.localPath ?? ""} onChange={(event) => updateSource(index, { localPath: event.target.value })} placeholder="rules/pac/example.list" />
+                    </Field>
+                  </div>
+                </details>
+              </div>
+            ))}
+          </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+          <div>
+            <CardTitle>直连方案</CardTitle>
+            <CardDescription>创建自己的方案，公开订阅在这里选择一个方案使用。</CardDescription>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Button variant="outline" onClick={addSet}>
+              <PlusIcon data-icon="inline-start" />
+              创建方案
+            </Button>
+            <Button variant="outline" disabled={!activeSet || busy !== ""} onClick={syncActiveSet}>
+              {busy === "sync" ? <Loader2Icon data-icon="inline-start" /> : <RefreshCcwIcon data-icon="inline-start" />}
+              同步当前方案
+            </Button>
+          </div>
+        </CardHeader>
+        <CardContent>
+          {activeSet ? (
+            <div className="grid gap-4 lg:grid-cols-[18rem_minmax(0,1fr)]">
+              <div className="space-y-2">
+                {setsDraft.map((set) => {
+                  const setReferencedCount = outputs.filter((output) => (output.pac.ruleSetId || defaultOutput.pac.ruleSetId) === set.id).length
+                  const selectedCount = set.sourceIds.filter((sourceId) => sourcesDraft.some((source) => source.id === sourceId)).length
+                  return (
+                    <button
+                      key={set.id}
+                      type="button"
+                      className={cn(
+                        "w-full rounded-md border p-3 text-left transition hover:bg-muted/40",
+                        set.id === activeSet.id && "border-primary bg-muted/35",
+                      )}
+                      onClick={() => setActiveSetId(set.id)}
+                    >
+                      <span className="block truncate text-sm font-medium">{set.name || "未命名方案"}</span>
+                      <span className="mt-1 block truncate text-xs text-muted-foreground">{set.id || "尚未设置 ID"}</span>
+                      <span className="mt-2 flex flex-wrap gap-1.5">
+                        <Badge variant="secondary">{selectedCount} 个来源</Badge>
+                        <Badge variant="outline">{cachedDomainCount(set)} 条缓存</Badge>
+                        {setReferencedCount ? <Badge>{setReferencedCount} 个订阅</Badge> : null}
+                      </span>
+                    </button>
+                  )
+                })}
+              </div>
+
+              <div className="space-y-4 rounded-lg border p-4">
+                <div className="grid gap-3 md:grid-cols-5">
+                  <Metric label="社区规则" value={selectedSources.length} />
+                  <RuleDomainDialog
+                    api={api}
+                    ruleSet={activeSet}
+                    scopeQuery={scopeQuery}
+                    count={activeCachedDomainCount}
+                    disabled={!activeSetIsSaved || activeCachedDomainCount === 0}
+                  />
+                  <Metric label="代理关键词" value={keywordRuleCount || "-"} />
+                  <Metric label="手工直连" value={manualDomainCount || "-"} />
+                  <Metric label="订阅引用" value={referencedOutputCount} />
+                </div>
+
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <Field>
+                    <FieldLabel>方案名称</FieldLabel>
+                    <Input value={activeSet.name} onChange={(event) => updateActiveSet({ name: event.target.value })} />
+                  </Field>
+                  <Field>
+                    <FieldLabel>方案 ID</FieldLabel>
+                    <Input value={activeSet.id} onChange={(event) => updateActiveSet({ id: event.target.value })} />
+                  </Field>
+                </div>
+
+                <Field>
+                  <div className="flex items-center justify-between gap-2">
+                    <FieldLabel>选择社区规则源</FieldLabel>
+                    <Badge variant="secondary">{selectedSources.length} / {sourcesDraft.length}</Badge>
+                  </div>
+                  <div className="grid gap-2 sm:grid-cols-2">
+                    {sourcesDraft.map((source) => {
+                      const selected = activeSet.sourceIds.includes(source.id)
+                      return (
+                        <label
+                          key={source.id}
+                          className={cn(
+                            "flex items-start gap-3 rounded-md border p-3 text-sm",
+                            selected && "border-primary/60 bg-muted/30",
+                          )}
+                        >
+                          <Checkbox
+                            checked={selected}
+                            onCheckedChange={(checked) => {
+                              const nextIDs = checked
+                                ? [...activeSet.sourceIds, source.id]
+                                : activeSet.sourceIds.filter((id) => id !== source.id)
+                              updateActiveSet({ sourceIds: splitList(nextIDs.join(",")) })
+                            }}
+                          />
+                          <span className="min-w-0">
+                            <span className="block truncate font-medium">{source.name}</span>
+                            <span className="mt-1 block text-xs text-muted-foreground">
+                              {cachedDomainCount(source)} 条，{source.lastSyncStatus === "error" ? "同步失败" : `最近同步 ${formatTime(source.lastSyncedAt)}`}
+                            </span>
+                          </span>
+                        </label>
+                      )
+                    })}
+                  </div>
+                  <FieldDescription>方案会合并已勾选的社区规则源，并应用下面的手工补充与排除名单。</FieldDescription>
+                </Field>
+
+                <div className="grid gap-4 xl:grid-cols-3">
+                  <EditableRuleRows
+                    label="总是代理的域名关键词"
+                    placeholder="poe"
+                    values={activeSet.domainKeywords ?? []}
+                    onChange={(values) => updateActiveSet({ domainKeywords: values })}
+                    emptyText="例如 poe，会生成 DOMAIN-KEYWORD 规则并交给节点选择。"
+                  />
+                  <EditableRuleRows
+                    label="总是直连的网站"
+                    placeholder="example.com"
+                    values={activeSet.directDomainSuffixes}
+                    onChange={(values) => updateActiveSet({ directDomainSuffixes: values })}
+                    emptyText="例如公司内网、国内服务、你确认不需要代理的网站。"
+                  />
+                  <EditableRuleRows
+                    label="不要直连的网站"
+                    placeholder="blocked.example.com"
+                    values={activeSet.excludedDomainSuffixes ?? []}
+                    onChange={(values) => updateActiveSet({ excludedDomainSuffixes: values })}
+                    emptyText="如果某个网站被社区规则误判为直连，在这里排除。"
+                  />
+                </div>
+
+                <details className="rounded-lg border bg-muted/20 p-3">
+                  <summary className="cursor-pointer text-sm font-medium">高级：直连 IP 段</summary>
+                  <div className="mt-4">
+                    <EditableRuleRows
+                      label="直连 IP 段"
+                      placeholder="10.0.0.0/8"
+                      values={activeSet.directCidrs}
+                      onChange={(values) => updateActiveSet({ directCidrs: values })}
+                      emptyText="只有明确知道 CIDR 含义时再填写。"
+                    />
+                  </div>
+                </details>
+
+                <Alert>
+                  <CheckCircle2Icon />
+                  <AlertTitle>当前方案：{activeSet.name}</AlertTitle>
+                  <AlertDescription>
+                    公开订阅会选择这个方案，不直接选择社区规则源。
+                    {referencedOutputCount ? ` 已被 ${referencedOutputNames.join("、")} 引用。` : " 还没有公开订阅引用。"}
+                    {activeSet.lastSyncStatus === "error" && activeSet.lastSyncError ? ` 最近同步失败：${activeSet.lastSyncError}` : ""}
+                  </AlertDescription>
+                </Alert>
+
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <p className="text-xs text-muted-foreground">
+                    最近同步：{formatTime(activeSet.lastSyncedAt)}
+                    {!activeSetIsSaved ? "。新方案保存后才能同步。" : ""}
+                  </p>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    disabled={setsDraft.length <= 1 || referencedOutputCount > 0}
+                    onClick={() => removeSet(activeSet.id)}
+                  >
+                    <Trash2Icon data-icon="inline-start" />
+                    删除方案
+                  </Button>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <Empty>
+              <EmptyHeader>
+                <EmptyMedia><FileTextIcon /></EmptyMedia>
+                <EmptyTitle>暂无直连方案</EmptyTitle>
+                <EmptyDescription>新建一个方案后即可选择社区规则源。</EmptyDescription>
+              </EmptyHeader>
+              <EmptyContent>
+                <Button onClick={addSet}>
+                  <PlusIcon data-icon="inline-start" />
+                  新建方案
+                </Button>
+              </EmptyContent>
+            </Empty>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+
+function EditableRuleRows({
+  label,
+  placeholder,
+  values,
+  onChange,
+  emptyText,
+}: {
+  label: string
+  placeholder: string
+  values: string[]
+  onChange: (values: string[]) => void
+  emptyText?: string
+}) {
+  const [query, setQuery] = useState("")
+  const [newValue, setNewValue] = useState("")
+  const rows = values
+  const normalizedQuery = query.trim().toLowerCase()
+  const visibleRows = rows
+    .map((value, index) => ({ value, index }))
+    .filter((row) => !normalizedQuery || row.value.toLowerCase().includes(normalizedQuery))
+
+  function updateRow(index: number, value: string) {
+    const next = rows.map((row, rowIndex) => rowIndex === index ? value : row)
+    onChange(next)
+  }
+
+  function addRow(value = "") {
+    const nextValue = value.trim()
+    onChange(splitLines([...values, nextValue].join("\n")))
+    setNewValue("")
+  }
+
+  function removeRow(index: number) {
+    const next = rows.filter((_row, rowIndex) => rowIndex !== index)
+    onChange(next)
+  }
+
+  function compactRows() {
+    onChange(splitLines(rows.join("\n")))
+  }
+
+  return (
+    <Field>
+      <div className="flex items-center justify-between gap-2">
+        <FieldLabel>{label}</FieldLabel>
+        <Badge variant="secondary">{values.length} 条</Badge>
+      </div>
+      <div className="flex flex-col gap-2 sm:flex-row">
+        <Input
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          placeholder={`搜索${label}`}
+        />
+        <div className="flex gap-2 sm:min-w-56">
+          <Input
+            className="font-mono"
+            value={newValue}
+            onChange={(event) => setNewValue(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && newValue.trim()) {
+                event.preventDefault()
+                addRow(newValue)
+              }
+            }}
+            placeholder={placeholder}
+          />
+          <Button type="button" variant="outline" size="icon" onClick={() => addRow(newValue)} disabled={!newValue.trim()}>
+            <PlusIcon />
+          </Button>
+        </div>
+      </div>
+      {rows.length || normalizedQuery ? (
+        <div className="max-h-64 overflow-auto rounded-md border">
+          {visibleRows.length ? visibleRows.map(({ value, index }) => (
+          <div key={index} className="flex items-center gap-2 border-b p-2 last:border-b-0">
+            <span className="w-10 shrink-0 text-center text-xs text-muted-foreground">{index + 1}</span>
+            <Input
+              className="h-9 font-mono text-sm"
+              value={value}
+              onBlur={compactRows}
+              onChange={(event) => updateRow(index, event.target.value)}
+              placeholder={placeholder}
+            />
+            <Button type="button" variant="ghost" size="icon" onClick={() => removeRow(index)}>
+              <Trash2Icon />
+            </Button>
+          </div>
+          )) : (
+          <div className="flex items-center justify-between gap-3 p-3 text-sm text-muted-foreground">
+            <span>没有匹配的规则</span>
+            <Button type="button" variant="outline" size="sm" onClick={() => addRow(query)} disabled={!query.trim()}>
+              <PlusIcon data-icon="inline-start" />
+              添加搜索词
+            </Button>
+          </div>
+          )}
+        </div>
+      ) : null}
+      <FieldDescription>
+        {normalizedQuery ? `显示 ${visibleRows.length} / ${values.length} 条，编辑后保存生效。` : values.length ? "可搜索、编辑、新增或删除，保存后生效。" : (emptyText ?? "暂无手工规则，可在右侧输入后添加。")}
+      </FieldDescription>
+    </Field>
+  )
+}
+
+function RuleDomainDialog({
+  api,
+  ruleSet,
+  scopeQuery,
+  count,
+  disabled,
+}: {
+  api: API
+  ruleSet: RuleSet
+  scopeQuery: string
+  count: number
+  disabled?: boolean
+}) {
+  const [open, setOpen] = useState(false)
+  const [query, setQuery] = useState("")
+  const [result, setResult] = useState<RuleDomainsView | null>(null)
+  const [loading, setLoading] = useState(false)
+
+  const loadDomains = useCallback(async (nextQuery: string) => {
+    if (!ruleSet?.id) {
+      return
+    }
+    setLoading(true)
+    try {
+      const params = new URLSearchParams({ limit: "500" })
+      const trimmedQuery = nextQuery.trim()
+      if (trimmedQuery) {
+        params.set("q", trimmedQuery)
+      }
+      setResult(await api.get<RuleDomainsView>(
+        withScope(`/api/rule-sets/${encodeURIComponent(ruleSet.id)}/domains?${params.toString()}`, scopeQuery),
+      ))
+    } catch (error) {
+      toast.error(messageOf(error))
+    } finally {
+      setLoading(false)
+    }
+  }, [api, ruleSet?.id, scopeQuery])
+
+  useEffect(() => {
+    if (open) {
+      void loadDomains("")
+    }
+  }, [loadDomains, open])
+
+  useEffect(() => {
+    if (!open) {
+      setQuery("")
+      setResult(null)
+    }
+  }, [open])
+
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <Metric
+        label="缓存域名"
+        value={count}
+        actionLabel="搜索缓存域名"
+        disabled={disabled}
+        onClick={() => {
+          if (!disabled) {
+            setOpen(true)
+          }
+        }}
+      />
+      <DialogContent className="max-h-[86vh] overflow-y-auto sm:max-w-4xl">
+        <DialogHeader>
+          <DialogTitle>缓存域名</DialogTitle>
+          <DialogDescription>
+            {ruleSet.name} 的方案规则明细，包含缓存、代理关键词、手工直连和排除项，支持用域名、来源或类型搜索。
+          </DialogDescription>
+        </DialogHeader>
+        <form
+          className="flex flex-col gap-2 sm:flex-row"
+          onSubmit={(event) => {
+            event.preventDefault()
+            void loadDomains(query)
+          }}
+        >
+          <Input
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="搜索域名或来源，例如 google source-a manual"
+            className="font-mono"
+          />
+          <div className="flex gap-2 sm:w-auto">
+            <Button type="submit" disabled={loading} className="flex-1 sm:flex-none">
+              {loading ? <Loader2Icon data-icon="inline-start" /> : <SearchIcon data-icon="inline-start" />}
+              查询
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              disabled={loading || !query.trim()}
+              onClick={() => {
+                setQuery("")
+                void loadDomains("")
+              }}
+            >
+              清空
+            </Button>
+          </div>
+        </form>
+        <div className="grid gap-3 sm:grid-cols-3">
+          <Metric label="全部" value={result?.total ?? count} />
+          <Metric label="匹配" value={result?.matched ?? "-"} />
+          <Metric label="展示上限" value={result?.limit ?? 500} />
+        </div>
+        <div className="min-h-0 overflow-hidden rounded-md border">
+          {loading && !result ? (
+            <div className="p-3">
+              <TableSkeleton />
+            </div>
+          ) : result?.domains.length ? (
+            <div className="max-h-[48vh] overflow-auto">
+              <Table>
+                <TableHeader className="sticky top-0 z-10 bg-popover">
+                  <TableRow>
+                    <TableHead className="w-16">#</TableHead>
+                    <TableHead>域名 / 关键词</TableHead>
+                    <TableHead>来源</TableHead>
+                    <TableHead>类型</TableHead>
+                    <TableHead className="w-16 text-right">操作</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {result.domains.map((row, index) => (
+                    <TableRow key={`${row.domain}-${row.source}-${row.type}-${index}`}>
+                      <TableCell className="text-xs text-muted-foreground tabular-nums">{index + 1}</TableCell>
+                      <TableCell className="min-w-56 font-mono">{row.domain}</TableCell>
+                      <TableCell className="max-w-56 truncate text-muted-foreground">{row.source || "-"}</TableCell>
+                      <TableCell>
+                        <RuleDomainTypeBadge type={row.type} />
+                      </TableCell>
+                      <TableCell className="text-right">
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon-sm"
+                          title="复制域名"
+                          onClick={() => copyText(row.domain)}
+                        >
+                          <ClipboardIcon />
+                        </Button>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+          ) : (
+            <div className="flex min-h-40 items-center justify-center p-4 text-sm text-muted-foreground">
+              {result ? "没有匹配的域名" : "打开后会加载缓存域名"}
+            </div>
+          )}
+        </div>
+        <p className="text-xs text-muted-foreground">
+          {result?.truncated ? `结果较多，仅展示前 ${result.limit} 条。` : "查询表达式会匹配域名、来源和类型；排除项用于说明哪些缓存域名不会进入直连结果。"}
+        </p>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function RuleDomainTypeBadge({ type }: { type: string }) {
+  if (type === "manual") {
+    return <Badge variant="secondary">手工直连</Badge>
+  }
+  if (type === "keyword") {
+    return <Badge>代理关键词</Badge>
+  }
+  if (type === "excluded") {
+    return <Badge variant="destructive">排除</Badge>
+  }
+  return <Badge variant="outline">缓存</Badge>
+}
+
+function Metric({
+  label,
+  value,
+  actionLabel,
+  disabled,
+  onClick,
+}: {
+  label: string
+  value: string | number
+  actionLabel?: string
+  disabled?: boolean
+  onClick?: () => void
+}) {
+  const interactive = Boolean(onClick)
+  const content = (
+    <>
+      <span className="text-xs text-muted-foreground">{label}</span>
+      <span className="mt-1 flex items-center justify-between gap-2">
+        <span className="truncate text-lg font-semibold">{value}</span>
+        {actionLabel && !disabled ? <SearchIcon className="size-4 text-muted-foreground" /> : null}
+      </span>
+      {actionLabel ? <span className="mt-1 text-xs text-muted-foreground">{disabled ? "暂无可搜索缓存" : actionLabel}</span> : null}
+    </>
+  )
+  if (interactive) {
+    return (
+      <button
+        type="button"
+        className={cn(
+          "rounded-lg border p-3 text-left transition",
+          disabled ? "cursor-not-allowed opacity-60" : "hover:bg-muted/35 focus-visible:ring-[3px] focus-visible:ring-ring/50",
+        )}
+        disabled={disabled}
+        onClick={onClick}
+      >
+        {content}
+      </button>
+    )
+  }
   return (
     <div className="rounded-lg border p-3">
-      <p className="text-xs text-muted-foreground">{label}</p>
-      <p className="mt-1 truncate text-lg font-semibold">{value}</p>
+      {content}
+    </div>
+  )
+}
+
+function OutputNodeNames({ names }: { names: string[] }) {
+  return (
+    <div className="rounded-lg border bg-muted/20 p-3">
+      <div className="mb-2 flex items-center justify-between gap-3">
+        <p className="text-xs font-medium text-muted-foreground">节点名称</p>
+        <span className="text-xs text-muted-foreground">{names.length} 个</span>
+      </div>
+      {names.length === 0 ? (
+        <p className="text-sm text-muted-foreground">暂无可用节点</p>
+      ) : (
+        <div className="flex max-h-24 flex-wrap gap-1.5 overflow-y-auto pr-1">
+          {names.map((name, index) => (
+            <span
+              key={`${name}-${index}`}
+              className="max-w-full truncate rounded-md border bg-background px-2 py-1 text-xs leading-none"
+              title={name}
+            >
+              {name}
+            </span>
+          ))}
+        </div>
+      )}
     </div>
   )
 }
@@ -2433,14 +3771,112 @@ async function request<T>(path: string, init: RequestInit, token: string): Promi
 }
 
 function splitList(value: string) {
-  return value.split(/[,，\n]/).map((item) => item.trim()).filter(Boolean)
+	return value.split(/[,，\n]/).map((item) => item.trim()).filter(Boolean)
+}
+
+function splitLines(value: string) {
+	return splitList(value)
 }
 
 function parseRenameRules(value: string) {
-  return value.split("\n").map((line) => {
-    const [pattern, ...rest] = line.split("=>")
-    return { pattern: pattern?.trim() ?? "", replacement: rest.join("=>").trim() }
-  }).filter((rule) => rule.pattern)
+	return value.split("\n").map((line) => {
+		const [pattern, ...rest] = line.split("=>")
+		return { pattern: pattern?.trim() ?? "", replacement: rest.join("=>").trim() }
+	}).filter((rule) => rule.pattern)
+}
+
+function normalizeOutputDraft(output: Output): Output {
+  const defaults = defaultOutput.pac
+  return {
+    ...output,
+    pac: {
+      ...defaults,
+      ...(output.pac ?? {}),
+      ruleSetId: output.pac?.ruleSetId ?? defaults.ruleSetId,
+      domainKeywords: output.pac?.domainKeywords ?? defaults.domainKeywords,
+      directDomainSuffixes: output.pac?.directDomainSuffixes ?? defaults.directDomainSuffixes,
+      directCidrs: output.pac?.directCidrs ?? defaults.directCidrs,
+      cachedDomainSuffixes: output.pac?.cachedDomainSuffixes ?? [],
+    },
+  }
+}
+
+function normalizeRuleSourceDraft(source: RuleSource): RuleSource {
+  const id = normalizeDraftID(source.id || source.name)
+  return {
+    ...source,
+    id,
+    name: source.name?.trim() || id || "规则源",
+    url: source.url?.trim() || "",
+    format: source.format || "domain-list",
+    refreshHours: Number.isFinite(source.refreshHours) && source.refreshHours > 0 ? source.refreshHours : 24,
+    localPath: source.localPath?.trim() || "",
+    cachedDomainSuffixes: splitList((source.cachedDomainSuffixes ?? []).join(",")),
+    cachedDomainCount: cachedDomainCount(source),
+  }
+}
+
+function normalizeRuleSetDraft(set: RuleSet): RuleSet {
+  const id = normalizeDraftID(set.id || set.name)
+  return {
+    ...set,
+    id,
+    name: set.name?.trim() || id || "规则集",
+    sourceIds: splitList((set.sourceIds ?? []).join(",")),
+    domainKeywords: splitList((set.domainKeywords ?? []).join(",")),
+    directDomainSuffixes: splitList((set.directDomainSuffixes ?? []).join(",")),
+    excludedDomainSuffixes: splitList((set.excludedDomainSuffixes ?? []).join(",")),
+    directCidrs: splitList((set.directCidrs ?? []).join(",")),
+    cachedDomainSuffixes: splitList((set.cachedDomainSuffixes ?? []).join(",")),
+    cachedDomainCount: cachedDomainCount(set),
+  }
+}
+
+function ruleSourceSavePayload(source: RuleSource) {
+  return {
+    id: source.id,
+    name: source.name,
+    url: source.url,
+    format: source.format,
+    refreshHours: source.refreshHours,
+    localPath: source.localPath ?? "",
+  }
+}
+
+function ruleSetSavePayload(set: RuleSet) {
+  return {
+    id: set.id,
+    name: set.name,
+    sourceIds: set.sourceIds,
+    domainKeywords: set.domainKeywords ?? [],
+    directDomainSuffixes: set.directDomainSuffixes,
+    excludedDomainSuffixes: set.excludedDomainSuffixes ?? [],
+    directCidrs: set.directCidrs,
+  }
+}
+
+function cachedDomainCount(item?: { cachedDomainCount?: number; cachedDomainSuffixes?: string[] }) {
+  return item?.cachedDomainCount ?? item?.cachedDomainSuffixes?.length ?? 0
+}
+
+function normalizeDraftID(value: string) {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_/\\]+/g, "-")
+    .replace(/[^a-z0-9-]/g, "")
+    .replace(/^-+|-+$/g, "")
+}
+
+function uniqueDraftID(prefix: string, ids: string[]) {
+  const used = new Set(ids)
+  let index = ids.length + 1
+  let id = `${prefix}-${index}`
+  while (used.has(id)) {
+    index += 1
+    id = `${prefix}-${index}`
+  }
+  return id
 }
 
 function formatTime(value?: string) {
@@ -2481,8 +3917,26 @@ function formatBytes(value?: number) {
   return `${size >= 10 || index === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[index]}`
 }
 
+function formatDelay(value?: number) {
+  const n = Number(value ?? 0)
+  if (!Number.isFinite(n) || n <= 0) {
+    return "-"
+  }
+  return `${Math.round(n)}ms`
+}
+
 function headersToText(headers?: Record<string, string>) {
   return Object.entries(headers ?? {}).map(([key, value]) => `${key}: ${value}`).join("\n")
+}
+
+function sourceInputReady(source: Source) {
+  if (!source.name.trim()) {
+    return false
+  }
+  if ((source.sourceType ?? "url") === "file") {
+    return Boolean(source.fileContent?.trim())
+  }
+  return Boolean(source.url?.trim())
 }
 
 function trafficStatusTitle(info?: TrafficInfo) {
@@ -2506,6 +3960,88 @@ function trafficInfoText(info?: TrafficInfo) {
     info.expireAt ? `到期 ${formatDate(info.expireAt)}` : "",
   ].filter(Boolean)
   return parts.join("，")
+}
+
+function TrafficDebugPanel({ info }: { info?: TrafficInfo }) {
+  const debug = info?.debug
+  if (!debug && !info?.lastError) {
+    return null
+  }
+  const meta = [
+    debug?.method && debug.url ? `${debug.method} ${debug.url}` : "",
+    debug?.method && !debug.url ? `${debug.method} 未填写 URL` : "",
+    debug?.status ? `HTTP ${debug.status}` : "",
+    debug?.contentType ? `Content-Type ${debug.contentType}` : "",
+    debug?.parserType ? `解析 ${debug.parserType}` : "",
+  ].filter(Boolean)
+  return (
+    <Dialog>
+      <DialogTrigger render={<Button type="button" variant="outline" size="sm" className="mt-2 w-fit" />}>
+        <BugIcon data-icon="inline-start" />
+        查看调试详情
+        {debug?.statusCode ? <span className="text-muted-foreground">HTTP {debug.statusCode}</span> : null}
+      </DialogTrigger>
+      <DialogContent className="max-h-[86vh] overflow-y-auto sm:max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>流量查询调试详情</DialogTitle>
+          <DialogDescription>请求响应、解析路径命中情况和响应片段。</DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-4 text-sm">
+          {info?.lastError ? (
+            <section className="grid gap-1">
+              <h4 className="text-sm font-medium">错误原因</h4>
+              <div className="break-words rounded-md border border-destructive/30 bg-destructive/5 p-2 text-destructive">
+                {info.lastError}
+              </div>
+            </section>
+          ) : null}
+          {meta.length ? (
+            <section className="grid gap-1">
+              <h4 className="text-sm font-medium">请求</h4>
+              <div className="break-words rounded-md border bg-muted/35 p-2 font-mono text-xs text-muted-foreground">
+                {meta.join("\n")}
+              </div>
+            </section>
+          ) : null}
+          {debug?.paths?.length ? (
+            <section className="grid gap-2">
+              <h4 className="text-sm font-medium">解析路径</h4>
+              <div className="grid gap-1">
+                {debug.paths.map((item, index) => (
+                  <div key={`${item.label}-${item.path}-${index}`} className="grid gap-1 rounded-md border p-2 sm:grid-cols-[4rem_1fr] sm:gap-3">
+                    <Badge className="w-fit" variant={item.found ? "secondary" : "destructive"}>
+                      {item.found ? "命中" : "未命中"}
+                    </Badge>
+                    <div className="min-w-0 break-words font-mono text-xs">
+                      <div className="text-foreground">{item.label} {item.path}</div>
+                      {item.value ? <div className="text-muted-foreground">值：{item.value}</div> : null}
+                      {item.error ? <div className="text-destructive">错误：{item.error}</div> : null}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </section>
+          ) : null}
+          {debug?.header ? (
+            <section className="grid gap-1">
+              <h4 className="text-sm font-medium">Subscription-Userinfo</h4>
+              <div className="break-words rounded-md border bg-muted/35 p-2 font-mono text-xs text-muted-foreground">
+                {debug.header}
+              </div>
+            </section>
+          ) : null}
+          {debug?.bodyPreview ? (
+            <section className="grid gap-1">
+              <h4 className="text-sm font-medium">响应片段</h4>
+              <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-md border bg-muted/35 p-3 font-mono text-xs leading-relaxed text-muted-foreground">
+                {debug.bodyPreview}
+              </pre>
+            </section>
+          ) : null}
+        </div>
+      </DialogContent>
+    </Dialog>
+  )
 }
 
 async function copyText(value: string, message = "已复制") {
@@ -2545,6 +4081,12 @@ function subscriptionURL(publicExampleUrl: string | undefined, slug: string, use
   return url.toString()
 }
 
+function pacURL(subscriptionUrl: string) {
+  const url = new URL(subscriptionUrl, window.location.origin)
+  url.pathname = url.pathname.replace(/\/s\/([^/]*)$/, (_match, slug) => `/s/${slug}.pac`)
+  return url.toString()
+}
+
 function downloadSubscription(baseURL: string, slug: string, format: string) {
   const item = downloadFormatItems.find((candidate) => candidate.value === format)
   const url = new URL(baseURL, window.location.origin)
@@ -2558,6 +4100,19 @@ function downloadSubscription(baseURL: string, slug: string, format: string) {
   link.click()
   document.body.removeChild(link)
   toast.success(`${item?.label ?? "配置文件"} 已开始下载`)
+}
+
+function downloadPAC(baseURL: string, slug: string) {
+  const url = new URL(baseURL, window.location.origin)
+  url.searchParams.set("download", "1")
+
+  const link = document.createElement("a")
+  link.href = url.toString()
+  link.download = `${slug || "subscription"}.pac`
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+  toast.success("PAC 文件已开始下载")
 }
 
 function fallbackCopyText(value: string) {

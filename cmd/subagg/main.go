@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -24,6 +25,7 @@ func main() {
 		os.Exit(1)
 	}
 	app := server.New(st, *staticPath, logger)
+	app.StartBackgroundTasks(context.Background())
 	logger.Info("sub-nest listening", "addr", *addr, "data", *dataPath)
 	if st.Snapshot().Settings.AdminTokenHash == "" {
 		fmt.Printf("首次启动：打开后台后设置管理 token，或使用 API POST /api/setup。\n")
