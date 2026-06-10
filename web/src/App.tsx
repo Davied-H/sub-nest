@@ -468,11 +468,20 @@ const defaultOutput: Output = {
 const downloadFormatItems = [
   { label: "Mihomo YAML", value: "mihomo", filename: "mihomo.yaml" },
   { label: "Clash YAML", value: "clash", filename: "clash.yaml" },
+  { label: "Surge 配置", value: "surge", filename: "surge.conf" },
   { label: "Base64 分享链接", value: "base64", filename: "subscription.txt" },
+]
+
+const copySubscriptionFormatItems = [
+  { label: "默认格式", value: "" },
+  { label: "Clash / Mihomo", value: "clash" },
+  { label: "Surge", value: "surge" },
+  { label: "Base64", value: "base64" },
 ]
 
 const outputFormatItems = [
   { label: "Clash / Mihomo YAML", value: "clash" },
+  { label: "Surge 配置", value: "surge" },
   { label: "Base64 分享链接", value: "base64" },
 ]
 
@@ -1051,10 +1060,7 @@ function Overview({
                     </p>
                   </div>
                   <div className="flex flex-wrap gap-2">
-                    <Button variant="outline" size="sm" onClick={() => copyText(url, "订阅地址已复制")}>
-                      <ClipboardIcon data-icon="inline-start" />
-                      订阅
-                    </Button>
+                    <CopySubscriptionMenu baseURL={url} compact />
                     <Button variant="outline" size="sm" onClick={() => copyText(pacUrl, "PAC 地址已复制")}>
                       <FileTextIcon data-icon="inline-start" />
                       PAC
@@ -1378,6 +1384,30 @@ function ProgressBar({ value }: { value: number }) {
   )
 }
 
+
+function CopySubscriptionMenu({ baseURL, compact = false }: { baseURL: string; compact?: boolean }) {
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger render={<Button variant="outline" size="sm" />}>
+        <ClipboardIcon data-icon="inline-start" />
+        {compact ? "订阅" : "复制订阅链接"}
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" className="w-48">
+        <DropdownMenuGroup>
+          {copySubscriptionFormatItems.map((item) => (
+            <DropdownMenuItem
+              key={item.value || "default"}
+              onClick={() => copyText(subscriptionURLWithFormat(baseURL, item.value), `${item.label}订阅地址已复制`)}
+            >
+              <ClipboardIcon />
+              {item.label}
+            </DropdownMenuItem>
+          ))}
+        </DropdownMenuGroup>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
 function SourceSheet({
   api,
   scopeQuery,
@@ -1807,10 +1837,7 @@ function OutputsView({
                     </div>
                     <OutputNodeNames names={output.nodeNames ?? []} />
                     <div className="flex flex-wrap gap-2">
-                      <Button variant="outline" size="sm" onClick={() => copyText(url, "公开订阅地址已复制")}>
-                        <ClipboardIcon data-icon="inline-start" />
-                        复制订阅链接
-                      </Button>
+                      <CopySubscriptionMenu baseURL={url} />
                       <Button variant="outline" size="sm" onClick={() => copyText(pacUrl, "PAC 地址已复制")}>
                         <FileTextIcon data-icon="inline-start" />
                         复制 PAC
@@ -1913,7 +1940,7 @@ function OutputSheet({
               <FieldDescription>最终地址形如 `/s/main`。</FieldDescription>
             </Field>
             <Field>
-              <FieldLabel>输出格式</FieldLabel>
+              <FieldLabel>默认输出格式</FieldLabel>
               <Select
                 items={outputFormatItems}
                 value={draft.format}
@@ -1930,6 +1957,7 @@ function OutputSheet({
                   </SelectGroup>
                 </SelectContent>
               </Select>
+              <FieldDescription>不带 `?format=` 的 `/s/{draft.slug || "slug"}` 会使用这个格式；复制链接和下载配置时仍可单独选择 Clash、Surge 或 Base64。</FieldDescription>
             </Field>
             {draft.format !== "base64" ? (
               <Field>
@@ -4084,6 +4112,16 @@ function subscriptionURL(publicExampleUrl: string | undefined, slug: string, use
 function pacURL(subscriptionUrl: string) {
   const url = new URL(subscriptionUrl, window.location.origin)
   url.pathname = url.pathname.replace(/\/s\/([^/]*)$/, (_match, slug) => `/s/${slug}.pac`)
+  return url.toString()
+}
+
+function subscriptionURLWithFormat(subscriptionUrl: string, format: string) {
+  const url = new URL(subscriptionUrl, window.location.origin)
+  if (format) {
+    url.searchParams.set("format", format)
+  } else {
+    url.searchParams.delete("format")
+  }
   return url.toString()
 }
 

@@ -173,6 +173,7 @@ http://<HOST>:18788/u/<USER_SLUG>/s/main
 ```text
 /s/main?format=mihomo&download=1
 /s/main?format=clash&download=1
+/s/main?format=surge&download=1
 /s/main?format=base64&download=1
 ```
 

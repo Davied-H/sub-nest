@@ -1585,6 +1585,8 @@ func normalizeOutputFormat(value string) string {
 		return "clash"
 	case "base64":
 		return "base64"
+	case "surge":
+		return "surge"
 	default:
 		return ""
 	}
@@ -1600,6 +1602,9 @@ func subscriptionFilename(slug string, format string) string {
 	}
 	if strings.EqualFold(format, "base64") {
 		return name + ".txt"
+	}
+	if strings.EqualFold(format, "surge") {
+		return name + ".conf"
 	}
 	return name + ".yaml"
 }
